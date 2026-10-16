@@ -1,0 +1,554 @@
+/*
+ * WC Bank Receipt — front-end receipt panel.
+ *
+ * ISOLATION CONTRACT
+ * ------------------
+ * Every rule in this file is scoped to the panel root `.wcrf-panel` and every custom
+ * property is declared on that root with a `--wcrf-` prefix. There is no selector for
+ * `body`, `:root`, `html`, a bare element (`button`, `input`, `form`, `a`, `img`, `h1`…),
+ * or a generic theme class (`.button`, `.card`, `.container`), so the panel cannot
+ * restyle a theme's buttons, forms, headings, links or layout — and a theme cannot
+ * accidentally restyle the panel through a shared class name.
+ *
+ * The panel is therefore safe to drop into a page, a widget area, a column, a block,
+ * an Elementor container or the WooCommerce order endpoints without a wrapper.
+ *
+ * Two panels on one page are two independent `.wcrf-panel` roots and share nothing but
+ * this stylesheet: the markup carries classes only (no element ids) and the behaviour
+ * lives in assets/js/frontend.js, which initialises each root separately.
+ *
+ * DESIGN TOKENS
+ * -------------
+ * This file declares the *defaults* of every adjustable value as a `--wcrf-*` custom
+ * property on the panel root. The plugin's «ظاهر و استایل» screen (and the Elementor
+ * widget, and the shortcode's `style=` attribute) never rewrites a selector: they print
+ * the values that differ as a `style` attribute **on that panel's own root element**
+ * (see includes/design-tokens.php). Nothing outside the panel subtree reads a `--wcrf-*`
+ * property, and an untouched installation prints no inline declaration at all.
+ *
+ * `WCR_Design_Tokens::defaults()` mirrors the table below value by value and an
+ * acceptance check (`STYLE-11`) compares the two, so the list cannot drift.
+ *
+ * Theme-aware defaults (they follow the theme, the user's colour scheme or the operating
+ * system instead of hard-coding a look):
+ *   --wcrf-font-family, --wcrf-font-size*, --wcrf-line-height   inherit from the theme;
+ *   --wcrf-text: CanvasText, --wcrf-surface/--wcrf-field-bg: Canvas,
+ *   --wcrf-muted/--wcrf-border: GrayText                        follow the system palette.
+ * The accent colours and every status pair stay plugin-owned, so the panel keeps a
+ * predictable, contrast-safe look on a theme that offers nothing usable.
+ *
+ * RTL: the panel sets its own `direction: rtl` and `text-align: right` on the root and
+ * switches back to `direction: ltr` for values that are always latin (card number,
+ * IBAN, countdown), so it looks right in both RTL and LTR themes.
+ *
+ * Sizing is relative (`em`, `calc()` of the spacing tokens): changing the base font size
+ * or the padding scales the whole component coherently instead of leaving stray pixels.
+ */
+
+.wcrf-panel {
+  /* Colours — accent */
+  --wcrf-pri: #1565c0;
+  --wcrf-pri-h: #1e88e5;
+  --wcrf-text: CanvasText;
+  --wcrf-muted: GrayText;
+  --wcrf-surface: Canvas;
+  --wcrf-border: GrayText;
+  /* Colours — bank card */
+  --wcrf-card-bg: #1565c0;
+  --wcrf-card-bg-2: #42a5f5;
+  --wcrf-card-text: #ffffff;
+  /* Colours — main button */
+  --wcrf-btn-bg: #1565c0;
+  --wcrf-btn-bg-2: #1e88e5;
+  --wcrf-btn-bg-h: #0d47a1;
+  --wcrf-btn-text: #ffffff;
+  /* Colours — upload field
+     `Canvas`, not `Field`: Chromium does not adapt `Field` to a dark colour scheme,
+     which would leave white text on a white zone in a dark theme. `Canvas` follows the
+     document's colour scheme, and the dashed border keeps the zone visible either way. */
+  --wcrf-field-bg: Canvas;
+  --wcrf-field-focus-bg: rgba(21, 101, 192, .12);
+  /* Colours — status: success / warning / error, text and matching background */
+  --wcrf-ok: #2e7d32;
+  --wcrf-ok-bg: #f1f8e9;
+  --wcrf-warn: #e65100;
+  --wcrf-warn-bg: #fff8e1;
+  --wcrf-err: #c62828;
+  --wcrf-err-bg: #fff8f8;
+  /* Typography */
+  --wcrf-font-family: inherit;
+  --wcrf-font-size: 1em;
+  --wcrf-font-size-title: 1.07em;
+  --wcrf-font-size-small: 0.93em;
+  --wcrf-line-height: inherit;
+  --wcrf-font-weight: 400;
+  --wcrf-font-weight-title: 700;
+  /* Shape and spacing */
+  --wcrf-radius: 12px;
+  --wcrf-radius-card: 18px;
+  --wcrf-radius-button: 10px;
+  --wcrf-radius-field: 8px;
+  --wcrf-border-width: 1.5px;
+  --wcrf-shadow: 0 8px 32px rgba(21, 101, 192, .30);
+  --wcrf-pad: 20px;
+  --wcrf-gap: 14px;
+  --wcrf-content-width: 580px;
+
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--wcrf-content-width);
+  margin: calc(var(--wcrf-gap) * 2) 0;
+  font-family: var(--wcrf-font-family);
+  font-size: var(--wcrf-font-size);
+  font-weight: var(--wcrf-font-weight);
+  line-height: var(--wcrf-line-height);
+  color: var(--wcrf-text);
+  direction: rtl;
+  text-align: right;
+}
+
+.wcrf-panel *,
+.wcrf-panel *::before,
+.wcrf-panel *::after {
+  box-sizing: border-box;
+}
+
+.wcrf-panel [hidden] {
+  display: none !important;
+}
+
+/* Long values (card number, IBAN, file name) must never widen the layout. */
+.wcrf-panel img {
+  max-width: 100%;
+  height: auto;
+}
+
+.wcrf-panel a,
+.wcrf-panel button,
+.wcrf-panel input,
+.wcrf-panel strong {
+  font-family: inherit;
+}
+
+/* ---- Neutral notice (denied access, editor placeholder, hints) ---- */
+.wcrf-panel .wcrf-notice {
+  background: var(--wcrf-surface);
+  border: var(--wcrf-border-width) solid var(--wcrf-border);
+  border-radius: var(--wcrf-radius);
+  padding: calc(var(--wcrf-pad) * .7) var(--wcrf-pad);
+  color: var(--wcrf-muted);
+  font-size: var(--wcrf-font-size-small);
+}
+
+/* ---- Bank card ---- */
+.wcrf-panel .wcrf-bank-card {
+  background: linear-gradient(135deg, var(--wcrf-card-bg) 0%, var(--wcrf-card-bg-2) 100%);
+  color: var(--wcrf-card-text);
+  border-radius: var(--wcrf-radius-card);
+  padding: calc(var(--wcrf-pad) * 1.2) calc(var(--wcrf-pad) * 1.3);
+  margin-bottom: var(--wcrf-gap);
+  box-shadow: var(--wcrf-shadow);
+  position: relative;
+  overflow: hidden;
+}
+
+.wcrf-panel .wcrf-bank-card::before {
+  content: "";
+  position: absolute;
+  top: -60%;
+  right: -40%;
+  width: 200%;
+  height: 220%;
+  background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, .12) 0%, transparent 55%);
+  pointer-events: none;
+}
+
+.wcrf-panel .wcrf-bank-card .bank-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: calc(var(--wcrf-gap) * .7);
+  margin-bottom: calc(var(--wcrf-gap) * 1.3);
+}
+
+.wcrf-panel .wcrf-bank-card .bank-name {
+  font-size: var(--wcrf-font-size-small);
+  font-weight: 600;
+  opacity: .88;
+  word-break: break-word;
+}
+
+.wcrf-panel .wcrf-bank-card .card-logo {
+  font-size: 1.9em;
+  line-height: 1;
+}
+
+.wcrf-panel .wcrf-bank-card .card-number {
+  font-size: 1.43em;
+  letter-spacing: 5px;
+  font-family: monospace, "Courier New", monospace;
+  margin-bottom: calc(var(--wcrf-gap) * 1.3);
+  direction: ltr;
+  unicode-bidi: embed;
+  text-align: center;
+  background: rgba(0, 0, 0, .15);
+  border-radius: var(--wcrf-radius-field);
+  padding: calc(var(--wcrf-pad) * .4);
+  overflow-wrap: anywhere;
+}
+
+.wcrf-panel .wcrf-bank-card .card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: calc(var(--wcrf-gap) * .85);
+  flex-wrap: wrap;
+}
+
+.wcrf-panel .wcrf-bank-card .holder {
+  font-size: 1em;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.wcrf-panel .wcrf-bank-card .sheba {
+  font-size: 0.79em;
+  opacity: .8;
+  direction: ltr;
+  unicode-bidi: embed;
+  text-align: right;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- Buttons of the panel (never the theme's buttons) ---- */
+.wcrf-panel .wcrf-copy-btn {
+  background: rgba(255, 255, 255, .22);
+  border: 1px solid rgba(255, 255, 255, .45);
+  color: var(--wcrf-card-text);
+  padding: calc(var(--wcrf-pad) * .3) calc(var(--wcrf-pad) * .6);
+  border-radius: calc(var(--wcrf-radius-button) * .6);
+  cursor: pointer;
+  font-size: var(--wcrf-font-size-small);
+  font-family: inherit;
+  line-height: 1.5;
+  transition: background .2s ease, border-color .2s ease;
+}
+
+.wcrf-panel .wcrf-copy-btn:hover,
+.wcrf-panel .wcrf-copy-btn:focus-visible {
+  background: rgba(255, 255, 255, .35);
+}
+
+.wcrf-panel .wcrf-copy-btn.copied {
+  background: rgba(255, 255, 255, .45);
+}
+
+.wcrf-panel .wcrf-copy-btn:focus-visible {
+  outline: 2px solid var(--wcrf-card-text);
+  outline-offset: 2px;
+}
+
+.wcrf-panel .wcrf-submit-btn {
+  display: block;
+  width: 100%;
+  padding: calc(var(--wcrf-pad) * .7);
+  background: linear-gradient(135deg, var(--wcrf-btn-bg), var(--wcrf-btn-bg-2));
+  color: var(--wcrf-btn-text);
+  border: none;
+  border-radius: var(--wcrf-radius-button);
+  font-size: var(--wcrf-font-size-title);
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: var(--wcrf-gap);
+  transition: transform .2s ease, box-shadow .2s ease, background .2s ease;
+}
+
+.wcrf-panel .wcrf-submit-btn:hover,
+.wcrf-panel .wcrf-submit-btn:focus-visible {
+  background: linear-gradient(135deg, var(--wcrf-btn-bg-h), var(--wcrf-btn-bg));
+  transform: translateY(-1px);
+  box-shadow: var(--wcrf-shadow);
+}
+
+.wcrf-panel .wcrf-submit-btn:focus-visible {
+  outline: 2px solid var(--wcrf-pri-h);
+  outline-offset: 2px;
+}
+
+.wcrf-panel .wcrf-submit-btn:disabled,
+.wcrf-panel .wcrf-submit-btn[aria-busy="true"] {
+  opacity: .6;
+  cursor: progress;
+  transform: none;
+  box-shadow: none;
+}
+
+/* ---- Countdown ---- */
+.wcrf-panel .wcrf-timer-box {
+  background: var(--wcrf-surface);
+  border: var(--wcrf-border-width) solid var(--wcrf-border);
+  border-radius: var(--wcrf-radius);
+  padding: calc(var(--wcrf-pad) * .7) var(--wcrf-pad);
+  margin-bottom: var(--wcrf-gap);
+  display: flex;
+  align-items: center;
+  gap: calc(var(--wcrf-gap) * .85);
+  flex-wrap: wrap;
+}
+
+.wcrf-panel .wcrf-timer-box.urgent {
+  border-color: var(--wcrf-err);
+  background: var(--wcrf-err-bg);
+}
+
+.wcrf-panel .wcrf-timer-lbl {
+  font-size: var(--wcrf-font-size-small);
+  color: var(--wcrf-muted);
+  white-space: nowrap;
+}
+
+.wcrf-panel .wcrf-timer-val {
+  font-size: 1.36em;
+  font-weight: var(--wcrf-font-weight-title);
+  color: var(--wcrf-pri-h);
+  font-family: monospace, "Courier New", monospace;
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.wcrf-panel .wcrf-timer-val.urgent {
+  color: var(--wcrf-err);
+}
+
+.wcrf-panel .wcrf-progress {
+  flex: 1 1 120px;
+  min-width: 80px;
+  height: calc(var(--wcrf-border-width) * 4);
+  background: var(--wcrf-border);
+  border-radius: calc(var(--wcrf-border-width) * 2);
+  overflow: hidden;
+}
+
+.wcrf-panel .wcrf-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--wcrf-pri), var(--wcrf-pri-h));
+  border-radius: calc(var(--wcrf-border-width) * 2);
+  transition: width 1s linear;
+}
+
+/* ---- Status boxes ---- */
+.wcrf-panel .wcrf-status-box {
+  background: var(--wcrf-surface);
+  border-radius: var(--wcrf-radius);
+  border-right: calc(var(--wcrf-border-width) * 2.5) solid var(--wcrf-border);
+  padding: calc(var(--wcrf-pad) * .9) var(--wcrf-pad);
+  margin-bottom: var(--wcrf-gap);
+}
+
+.wcrf-panel .wcrf-status-box.approved {
+  border-right-color: var(--wcrf-ok);
+  background: var(--wcrf-ok-bg);
+}
+
+.wcrf-panel .wcrf-status-box.rejected {
+  border-right-color: var(--wcrf-err);
+  background: var(--wcrf-err-bg);
+}
+
+.wcrf-panel .wcrf-status-box.pending {
+  border-right-color: var(--wcrf-warn);
+  background: var(--wcrf-warn-bg);
+}
+
+.wcrf-panel .wcrf-status-title {
+  font-size: var(--wcrf-font-size-title);
+  font-weight: var(--wcrf-font-weight-title);
+  margin-bottom: 6px;
+}
+
+.wcrf-panel .wcrf-status-box.approved .wcrf-status-title { color: var(--wcrf-ok); }
+.wcrf-panel .wcrf-status-box.rejected .wcrf-status-title { color: var(--wcrf-err); }
+.wcrf-panel .wcrf-status-box.pending  .wcrf-status-title { color: var(--wcrf-warn); }
+
+.wcrf-panel .wcrf-status-note {
+  font-size: 1em;
+  color: var(--wcrf-muted);
+}
+
+.wcrf-panel .wcrf-reject-reason {
+  background: var(--wcrf-err-bg);
+  border-radius: var(--wcrf-radius-field);
+  padding: calc(var(--wcrf-pad) * .4) calc(var(--wcrf-pad) * .6);
+  font-size: var(--wcrf-font-size-small);
+  color: var(--wcrf-err);
+  margin-top: calc(var(--wcrf-gap) * .55);
+  overflow-wrap: anywhere;
+}
+
+.wcrf-panel .wcrf-prev-link {
+  font-size: var(--wcrf-font-size-small);
+  color: var(--wcrf-pri-h);
+  text-decoration: none;
+  display: inline-block;
+  margin-top: calc(var(--wcrf-gap) * .55);
+  overflow-wrap: anywhere;
+}
+
+.wcrf-panel .wcrf-prev-link:hover,
+.wcrf-panel .wcrf-prev-link:focus-visible {
+  text-decoration: underline;
+}
+
+.wcrf-panel .wcrf-inline-receipt {
+  display: block;
+  max-width: 220px;
+  border-radius: var(--wcrf-radius-field);
+}
+
+/* ---- Upload zone ----
+   The file input covers the whole zone, so picking a file *and* dropping one work
+   with no JavaScript at all; the script only adds the preview and the drag styling. */
+.wcrf-panel .wcrf-form {
+  margin: 0;
+}
+
+.wcrf-panel .wcrf-drop-zone {
+  position: relative;
+  border: calc(var(--wcrf-border-width) * 1.66) dashed var(--wcrf-border);
+  border-radius: var(--wcrf-radius);
+  padding: calc(var(--wcrf-pad) * 1.5) var(--wcrf-pad);
+  text-align: center;
+  background: var(--wcrf-field-bg);
+  transition: border-color .3s ease, background .3s ease;
+  cursor: pointer;
+}
+
+.wcrf-panel .wcrf-drop-zone:hover,
+.wcrf-panel .wcrf-drop-zone:focus-within,
+.wcrf-panel .wcrf-drop-zone.is-dragging {
+  border-color: var(--wcrf-pri-h);
+  background: var(--wcrf-field-focus-bg);
+}
+
+.wcrf-panel .wcrf-file-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 0;
+}
+
+.wcrf-panel .wcrf-drop-icon {
+  font-size: 3.14em;
+  color: var(--wcrf-muted);
+  transition: color .3s ease, transform .3s ease;
+  margin-bottom: calc(var(--wcrf-gap) * .7);
+  pointer-events: none;
+}
+
+.wcrf-panel .wcrf-drop-zone:hover .wcrf-drop-icon,
+.wcrf-panel .wcrf-drop-zone:focus-within .wcrf-drop-icon,
+.wcrf-panel .wcrf-drop-zone.is-dragging .wcrf-drop-icon {
+  color: var(--wcrf-pri-h);
+  transform: translateY(-4px);
+}
+
+.wcrf-panel .wcrf-drop-text {
+  font-size: var(--wcrf-font-size-title);
+  color: var(--wcrf-text);
+  margin-bottom: calc(var(--wcrf-gap) * .4);
+  pointer-events: none;
+}
+
+.wcrf-panel .wcrf-drop-hint {
+  font-size: var(--wcrf-font-size-small);
+  color: var(--wcrf-muted);
+  pointer-events: none;
+}
+
+.wcrf-panel .wcrf-preview-wrap {
+  position: relative;
+  margin-top: var(--wcrf-gap);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--wcrf-gap) * .85);
+  flex-wrap: wrap;
+  pointer-events: none;
+}
+
+.wcrf-panel .wcrf-preview-img {
+  max-width: 190px;
+  max-height: 150px;
+  border-radius: var(--wcrf-radius-field);
+  box-shadow: var(--wcrf-shadow);
+}
+
+.wcrf-panel .wcrf-file-name {
+  font-size: var(--wcrf-font-size-small);
+  color: var(--wcrf-text);
+  background: var(--wcrf-field-focus-bg);
+  padding: 3px 10px;
+  border-radius: var(--wcrf-radius-field);
+  overflow-wrap: anywhere;
+}
+
+/* ---- Warnings ---- */
+.wcrf-panel .wcrf-no-card {
+  background: var(--wcrf-warn-bg);
+  border-radius: var(--wcrf-radius);
+  border-right: calc(var(--wcrf-border-width) * 2.5) solid var(--wcrf-warn);
+  padding: calc(var(--wcrf-pad) * .8) var(--wcrf-pad);
+  color: var(--wcrf-warn);
+  font-size: 1em;
+}
+
+.wcrf-panel .wcrf-expired {
+  background: var(--wcrf-err-bg);
+  border-radius: var(--wcrf-radius);
+  border-right: calc(var(--wcrf-border-width) * 2.5) solid var(--wcrf-err);
+  padding: calc(var(--wcrf-pad) * .8) var(--wcrf-pad);
+  color: var(--wcrf-err);
+  font-size: var(--wcrf-font-size-title);
+  font-weight: var(--wcrf-font-weight-title);
+}
+
+/* ---- Narrow screens and narrow page-builder columns ---- */
+@media screen and (max-width: 480px) {
+  .wcrf-panel {
+    margin: var(--wcrf-gap) 0;
+    font-size: 0.93em;
+  }
+
+  .wcrf-panel .wcrf-bank-card {
+    padding: calc(var(--wcrf-pad) * .9) calc(var(--wcrf-pad) * .8);
+    border-radius: calc(var(--wcrf-radius-card) * .78);
+  }
+
+  .wcrf-panel .wcrf-bank-card .card-number {
+    font-size: 1.15em;
+    letter-spacing: 3px;
+  }
+
+  .wcrf-panel .wcrf-bank-card .card-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: calc(var(--wcrf-gap) * .7);
+  }
+
+  .wcrf-panel .wcrf-copy-btn {
+    width: 100%;
+  }
+
+  .wcrf-panel .wcrf-timer-box {
+    padding: calc(var(--wcrf-pad) * .6) calc(var(--wcrf-pad) * .7);
+  }
+
+  .wcrf-panel .wcrf-timer-val {
+    font-size: 1.21em;
+  }
+}

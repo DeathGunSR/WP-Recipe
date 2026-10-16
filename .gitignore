@@ -1,0 +1,10 @@
+/.freebuff
+/dist
+/tests
+/tools
+COMPAT-REPORT.md
+RELEASE-REPORT.md
+RELEASE_AUDIT_REPORT.md
+RELEASE_TEST_MATRIX.md
+APPEARANCE-REPORT.md
+/wc-bank-receipt/docs
