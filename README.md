@@ -197,7 +197,6 @@ Customer (order-received / view-order)          Shop (wp-admin)
 WP-Cron (hourly): wc_receipt_cleanup_hook → delete expired files
                   wc_receipt_reminder_hook → one SMS before deadline
                   wc_receipt_expire_hook   → close overdue orders
-```
 
 **State machine:** `pending_review → approved | rejected`; meta is **always saved before** `update_status()` so the hooks read the correct state (see §6). Alert events are a separate concern with their own table and never change an order (`docs/alerts.md`).
 
@@ -207,6 +206,9 @@ WP-Cron (hourly): wc_receipt_cleanup_hook → delete expired files
 
 ## 5. Technology stack
 
+| Technology | Role in the project |
+|---|---|
+| **WordPress plugin APIs** | Menus, settings API, nonces/capabilities, rewrite endpoint, WP-Cron, text domain i18n (Persian RTL) |
 | Technology | Role in the project |
 |---|---|
 | **WordPress plugin APIs** | Menus, settings API, nonces/capabilities, rewrite endpoint, WP-Cron, text domain i18n (Persian RTL) |
@@ -317,12 +319,17 @@ second suite refuses to start instead of corrupting the first one's evidence.
 ### Roadmap (not implemented yet)
 
 - PHPUnit + CI workflow; `.pot` catalog and English language pack.
+### Roadmap (not implemented yet)
+
 - Split the class into modules (receipts / cards / alerts / SMS / cron).
 - Re-enable the SMS tab (the layer is intact) once its provider contract is re-verified on a live account.
 - Optional alert filters (per status, per payment method) and a persistent "alert history" view.
 
 ## 10. Documentation
 
+| Doc | Contents |
+|---|---|
+| [README.fa.md](README.fa.md) | The Persian version of this document |
 | Doc | Contents |
 |---|---|
 | [README.fa.md](README.fa.md) | The Persian version of this document |
