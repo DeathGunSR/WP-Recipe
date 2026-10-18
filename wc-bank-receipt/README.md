@@ -8,7 +8,7 @@ The receipt panel is a single, template-independent component you can place with
 shortcode, an Elementor widget or the automatic WooCommerce hooks — its CSS and JS are
 scoped to the panel, so it drops into any theme, page builder or column.
 
-* **Version:** 7.5.1
+* **Version:** 7.6.0
 * **Requires:** WordPress 6.5+, WooCommerce 7.1+, PHP 7.4+ (tested on WP 7.1.3 / WC 11.2.1 / PHP 8.2)
 * **License:** GPL-2.0-or-later
 * **Text domain:** `wc-bank-receipt`
@@ -22,11 +22,16 @@ scoped to the panel, so it drops into any theme, page builder or column.
   claim, so a card is charged once, a log row is written once and an SMS is sent once.
 * Approval completes the WooCommerce payment cycle (`payment_complete()`) **and verifies**
   the paid state; a failure is reported as an error instead of a silent success.
-* **Order alerts:** a manager who keeps wp-admin open gets a popup and an audible alert
+* **Order alerts:** a manager who keeps wp-admin open gets a popup and a repeating alarm
   for a new order (any payment method) and for any order status change, with the previous
-  and the new status. Each manager has their own queue, the popup links straight to the
-  order edit screen, the beep is generated locally (Web Audio, no file and no network) and
-  it can be switched off in the settings. Deleted orders stay readable from the snapshot.
+  and the new status. Every event records **who caused it** -- customer, gateway, automation
+  and unknown origins ring; a manager's own status change, a receipt decision in wp-admin
+  and the plugin's internal transitions do not (the SMS policy is decided separately, so a
+  suppressed alert never silences the customer's message). Each manager has their own queue,
+  the alarm repeats until the event is acknowledged (12 s by default, bounded), one tab owns
+  the sound, the popup links straight to the order edit screen, and the sound is generated
+  locally (Web Audio, no file and no network). Deleted orders stay readable from the
+  snapshot.
 * Deadlines, reminders and retention run on WP-Cron, independent of customer page views.
 * Receipt files live in a protected uploads folder and are streamed through an
   authorization-checked viewer — never through a public URL.
@@ -54,9 +59,18 @@ single instance only.
 * **Assets load where the panel is:** the WooCommerce order endpoints and any singular page
 (including Elementor layouts stored in post meta) that actually renders the panel —
 nowhere else. Versioned with the release, removable with `wp_dequeue_style/script`.
-* The SMS interface is temporarily disabled in this release (`SMS_UI_ENABLED = false`):
-  its tab and pages are closed and no SMS is sent, while settings, credentials and log
-  data are preserved for a later release.
+* **SMS, opt-in:** Kavenegar, Melli Payamak or a custom HTTP endpoint; per-event templates
+  (new order, chosen statuses, receipt upload, approve, reject, reminder and an explicit
+  test message) over an allow-listed variable set; bounded retries with backoff; a duplicate
+  guard keyed on the event; and a delivery history with the attempt count, the HTTP code and
+  a redacted provider answer. Nothing is sent until the master switch, a provider and at
+  least one event template are configured.
+* **One receipt viewer for both roles:** a shared overlay (`lightbox.js` / `lightbox.css`)
+  with `Escape`, backdrop and button close, focus restore and scroll lock -- on the manager's
+  order screen and in the customer's panel. A PDF opens as a document, not as an image.
+* **One receipt state model:** `awaiting_payment`, `under_review`, `rejected` and `approved`
+  drive the card block, the countdown, the drop zone and the notices; a rejection restarts
+  the deadline from the rejection time, never from the order date.
 * No telemetry, no hidden outbound request.
 
 ## Documentation
@@ -65,7 +79,8 @@ nowhere else. Versioned with the release, removable with `wp_dequeue_style/scrip
 |---|---|
 | [README-fa.md](README-fa.md) | راهنمای کامل فارسی: نصب، راه‌اندازی، چرخه وضعیت، تنظیمات، عیب‌یابی |
 | [docs/state-machine.md](docs/state-machine.md) | Order/receipt state machine, guards and idempotency |
-| [docs/alerts.md](docs/alerts.md) | Order-alert event queue, popup, sound and delivery semantics |
+| [docs/alerts.md](docs/alerts.md) | Order-alert event queue, origins, popup, repeating sound and delivery semantics |
+| [docs/sms.md](docs/sms.md) | SMS providers, events, templates, variables, retries and the delivery log |
 | [docs/compatibility.md](docs/compatibility.md) | Display methods, shortcode and Elementor widget docs, CSS/JS isolation contract, compatibility matrix and limitations |
 | [docs/appearance.md](docs/appearance.md) | Appearance tokens, defaults, presets, precedence order and the settings screen |
 | [docs/retention-policy.md](docs/retention-policy.md) | When receipt files are kept or deleted |

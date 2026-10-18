@@ -14,7 +14,7 @@
 
 </div>
 
-> A WooCommerce plugin (v7.5.1) that turns manual bank-transfer verification into a complete workflow: customers upload their receipt on the order page with a countdown, the shop reviews it in one click (or in bulk), rotating destination bank cards never blow past their limits — and every new order or status change raises a sound + popup alert in wp-admin. The receipt panel is one template-independent component that can be placed by the automatic WooCommerce hooks, by the `[wc_bank_receipt]` shortcode or by an Elementor widget, with its CSS and JS scoped to the panel — and its whole look is a documented set of design tokens a shop owner can set from wp-admin (theme-aware by default) without writing CSS. The repository name is a pun on *receipt*.
+> A WooCommerce plugin (v7.6.0) that turns manual bank-transfer verification into a complete workflow: customers upload their receipt on the order page with a countdown, the shop reviews it in one click (or in bulk), rotating destination bank cards never blow past their limits — and every new order or status change raises a sound + popup alert in wp-admin. The receipt panel is one template-independent component that can be placed by the automatic WooCommerce hooks, by the `[wc_bank_receipt]` shortcode or by an Elementor widget, with its CSS and JS scoped to the panel — and its whole look is a documented set of design tokens a shop owner can set from wp-admin (theme-aware by default) without writing CSS. Every order event records **who caused it** (so a manager's own action never rings their own dashboard), the dashboard alarm repeats until it is acknowledged, one shared viewer serves both the manager and the customer, and the SMS pipeline (providers, per-event templates, bounded retries, delivery history) is back as an opt-in layer that stays silent until it is configured. The repository name is a pun on *receipt*.
 
 ---
 
@@ -48,17 +48,18 @@ This plugin replaces that whole loop with one workflow inside WordPress:
 
 | Path | What it is |
 |---|---|
-| [`wc-bank-receipt/`](wc-bank-receipt) | The plugin as it ships: `wc-bank-receipt.php` (v7.5.1) plus `assets/` (panel CSS + JS + the admin appearance script), `includes/` (the design-token registry and the lazily loaded Elementor widget), `uninstall.php`, `readme.txt`, README + `docs/` (compatibility, appearance, alerts, state machine, retention policy, security model, troubleshooting, screenshots), CHANGELOG, LICENSE |
-| [`dist/wc-bank-receipt-7.5.1.zip`](dist/wc-bank-receipt-7.5.1.zip) | Installable release package (ZIP root = `wc-bank-receipt/`) |
-| [`tests/acceptance.php`](tests/acceptance.php) | Acceptance harness: HTTP/DB checks in 15 groups (security, lifecycle, alerts, order flow, cards, files, SMS, performance, HPOS, compatibility, templates/page builders, Elementor, themes, order screens, appearance) |
-| [`tests/evidence/`](tests/evidence) | Raw evidence: the 7.1.0 baseline, the full 7.3.0 and 7.4.0 runs (77 checks), the 7.4.0 run against the installed ZIP (73 checks), the Elementor run, the full 7.5.0 run (91 checks), the 7.5.0 run against the installed ZIP (91 checks), the pre-release audit runs (7.5.0 before the fix, the fixed tree, and the released 7.5.1 package), the decision-race probe before/after and the WP Plugin Check output |
+| [`wc-bank-receipt/`](wc-bank-receipt) | The plugin as it ships: `wc-bank-receipt.php` (v7.6.0) plus `assets/` (panel CSS + JS, the receipt viewer, the admin appearance script), `includes/` (the design-token registry and the lazily loaded Elementor widget), `uninstall.php`, `readme.txt`, README + `docs/` (compatibility, appearance, alerts, SMS, state machine, retention policy, security model, troubleshooting, screenshots), CHANGELOG, LICENSE |
+| [`dist/wc-bank-receipt-7.6.0.zip`](dist/wc-bank-receipt-7.6.0.zip) | Installable release package (ZIP root = `wc-bank-receipt/`), byte-identical to the reviewed tree |
+| [`tests/acceptance.php`](tests/acceptance.php) | Acceptance harness: HTTP/DB checks in 18 groups — security, lifecycle, alerts, order flow, cards, files, SMS, performance, HPOS, compatibility, templates/page builders, Elementor, themes, order screens, appearance, **event origins**, **receipt viewer**, **receipt state / alarm UI** — 124 checks in total |
+| [`tests/evidence/`](tests/evidence) | Raw evidence: the 7.1.0 baseline (22 pass / 29 fail), the full 7.3.0 and 7.4.0 runs (77 checks), the 7.4.0 run against the installed ZIP (73 checks), the Elementor run, the full 7.5.0 run (91 checks), the 7.5.0 run against the installed ZIP (91 checks), the pre-release audit runs (7.5.0 before the fix, the fixed tree and the released 7.5.1 package), the decision-race probe before/after, the WP Plugin Check output, and for 7.6.0 the full 18-group run (124 checks) plus the same package installed from its ZIP (59 checks over the changed groups) |
 | [`RELEASE-REPORT.md`](RELEASE-REPORT.md) · [`COMPAT-REPORT.md`](COMPAT-REPORT.md) · [`APPEARANCE-REPORT.md`](APPEARANCE-REPORT.md) | Phase reports (7.3.0 alerts, 7.4.0 templates, 7.5.0 appearance): root causes, before/after evidence, remaining risks |
+| [`IMPLEMENTATION_REPORT.md`](IMPLEMENTATION_REPORT.md) · [`IMPLEMENTATION_TEST_REPORT.md`](IMPLEMENTATION_TEST_REPORT.md) | 7.6.0 report pair: what changed and why (origins, alarm, viewer, state model, SMS pipeline, upgrade path) and the test report with every check's actual evidence |
 | [`RELEASE_AUDIT_REPORT.md`](RELEASE_AUDIT_REPORT.md) · [`RELEASE_TEST_MATRIX.md`](RELEASE_TEST_MATRIX.md) | Pre-release audit of 7.5.0/7.5.1: threat model, findings with severity and evidence, the order/receipt state machine, the full test matrix with PASS/FAIL/BLOCKED/NOT RUN states, and the release decision. The audit report is **not** part of the installable ZIP — it contains security detail that is deliberately kept out of the public package |
 | [`tools/`](tools) | `build-release.sh` (builds the ZIP, blocks secrets/developer paths), `run-acceptance.sh` (runs the harness against the local test site) and `screenshots.mjs` (real UI screenshots, including the live alert popup) |
 | [`README.md`](README.md) | This document · [فارسی](README.fa.md) |
 | [`.gitattributes`](.gitattributes) | LF normalization |
 
-> **Install note:** upload `dist/wc-bank-receipt-7.5.1.zip` through *Plugins → Add New → Upload Plugin* (or `wp plugin install dist/wc-bank-receipt-7.5.1.zip`). The ZIP is self-contained — main file, assets, the Elementor widget file, docs and screenshots; nothing outside it is required. The pristine 7.1.0 file is still in Git history (`git show HEAD:test-receipt.php`).
+> **Install note:** upload `dist/wc-bank-receipt-7.6.0.zip` through *Plugins → Add New → Upload Plugin* (or `wp plugin install dist/wc-bank-receipt-7.6.0.zip`). The ZIP is self-contained — main file, assets, the Elementor widget file, docs and screenshots; nothing outside it is required. The pristine 7.1.0 file is still in Git history (`git show HEAD:test-receipt.php`).
 
 ## 3. Features
 
@@ -148,6 +149,37 @@ This plugin replaces that whole loop with one workflow inside WordPress:
   option group, so an appearance save can never write a payment/retention setting and a
   stored value can never become raw CSS. Reset restores inheritance.
 
+### Event origins, a repeating alarm, one viewer and the SMS pipeline — new in 7.6.0
+- **Every event records who caused it.** A queued event carries an `origin`
+  (`customer_checkout`, `customer_receipt_upload`, `admin_manual_action`,
+  `admin_receipt_review`, `payment_gateway`, `system_automation`, `plugin_internal`,
+  `unknown`) and a `suppressed` flag. A manager's own status change, a receipt decision in
+  wp-admin and the plugin's internal transitions do **not** ring the dashboard; customer,
+  gateway, automation and unknown origins do. `is_admin()` is never used as proof of
+  origin: classification is a scoped per-request context that is always released, even on
+  an exception, and the SMS policy is decided separately, so a suppressed dashboard alert
+  never silences the customer's message.
+- **The alarm is not a one-shot beep.** While an event is unacknowledged the sound repeats
+  (12 s by default, filterable, bounded 3–300 s). Acknowledge, dismiss and *View order*
+  each record the acknowledgement in the tab and on the server first, stop only that event,
+  and hand the alarm to the next queued one. A short `localStorage` lease makes one tab the
+  sound leader, so a second tab draws the popup without beeping twice.
+- **One receipt viewer for both roles** (`assets/js/lightbox.js` + `assets/css/lightbox.css`):
+  fixed overlay, contain-fit image bounded to the viewport, close button, backdrop and
+  `Escape`, focus restore and scroll lock; a PDF opens as a document. The file is still
+  streamed through the authorization-checked endpoint with `Cache-Control: private,
+  no-store`, so the uploads folder stays protected and the guest keeps only the local
+  preview of the file they just uploaded.
+- **One receipt state model** (`receipt_phase()`): `awaiting_payment` (card, countdown,
+  form), `under_review` (no card, no countdown, the receipt is viewable), `rejected`
+  (reason, previous file, a countdown restarted from the rejection) and `approved`
+  (confirmation only). The card block, the countdown, the drop zone and the notices all
+  read it, and a failed status change no longer leaves the panel claiming a review the
+  order is not in.
+- **The SMS screens are back** as an opt-in pipeline (next-but-one section), and the
+  appearance preview is click-to-edit: clicking a part of the preview opens exactly the
+  tokens that style it.
+
 ### Review and reporting tools
 - Review box inside the WooCommerce order screen (state badges, lightbox preview, approve/reject with reason) — plus a receipt-state **column in the order list**, wired for **both classic and HPOS** list tables.
 - **Bulk review page**: approve/reject many orders at once with one shared reason (paged, 50 per page).
@@ -159,11 +191,13 @@ This plugin replaces that whole loop with one workflow inside WordPress:
 - Per-card, independently toggleable limits: **total amount**, **transaction count**, **expiry date**; live used/remaining columns and reason-tagged inactive badges.
 - `get_active_card()` walks cards in priority order, skipping exhausted or expired ones; the assigned card id is stored on the order and charged **only at approval** (bulk included).
 
-### SMS layer (interface temporarily disabled)
+### SMS layer (opt-in, silent until configured)
 - Three providers behind one interface: **Kavenegar**, **Melli Payamak**, and a **custom endpoint** (optional Bearer token); 15 s timeouts, `WP_Error` handled.
-- Per-event **templates and senders** for: approved, rejected, payment reminder, cancelled, admin-on-upload; plus an admin alert number.
-- Every send is written to `sms_log` with recipient, message, status (`sent`/`failed`/`unknown`) and the provider response; a provider error is never recorded as a success.
-- **In this release the SMS UI is switched off** (`SMS_UI_ENABLED = false`): the menu entry is not registered, both SMS pages answer `403` even for an administrator, and no SMS is ever sent. Nothing is deleted — table, settings, templates and credentials stay, ready for a later release. Order alerts are completely independent of SMS.
+- Per-event **templates and switches** for: new order, any chosen order status, receipt upload (admin notice), approved, rejected, payment reminder and an explicit test message — each event decides for itself, so statuses are chosen rather than blanket-enabled.
+- Templates are plain text plus an allow-listed variable set (`{order_id}`, `{order_number}`, `{old_status}`, `{new_status}`, `{order_status}`, `{customer_name}`, `{billing_first_name}`, `{billing_last_name}`, `{billing_phone}`, `{order_total}`, `{currency}`, `{payment_method}`, `{site_name}`, `{order_date}`, `{receipt_status}`, `{receipt_reject_reason}`) resolved by one function from the order object. No `eval`, no request data; an unknown variable is reported in the preview and left as typed, and the preview never sends.
+- One pipeline: `sms_send_event()` decides *whether*, `sms_deliver()` queues the row, `sms_attempt()` talks to the provider. Success is judged from the HTTP code **and** the provider payload, never from “no `WP_Error`”. Retries are bounded (3 attempts, 2/4/8-minute backoff) and only for transient failures; an invalid number fails once. A duplicate guard keyed on the event keeps the status hook and the receipt decision from sending the same message twice.
+- `sms_log` records recipient, message, status (`sent`/`failed`/`unknown`), attempts, HTTP code, provider id, the next attempt and the **redacted** provider response; credentials and authentication headers are redacted before anything is stored and masked on screen. The history page shows the delivery state, the attempt count and a safe error summary with filters and pagination.
+- **Nothing is sent until the master switch, a provider and at least one event template are configured.** Order alerts are completely independent of SMS.
 
 ### Admin quality-of-life
 - Hourly **cleanup cron** counting retention from the **upload time** (approved receipts are kept by default) plus hourly deadline-reminder and deadline-enforcement crons; deactivation stops the schedules without deleting anything.
@@ -209,12 +243,9 @@ WP-Cron (hourly): wc_receipt_cleanup_hook → delete expired files
 | Technology | Role in the project |
 |---|---|
 | **WordPress plugin APIs** | Menus, settings API, nonces/capabilities, rewrite endpoint, WP-Cron, text domain i18n (Persian RTL) |
-| Technology | Role in the project |
-|---|---|
-| **WordPress plugin APIs** | Menus, settings API, nonces/capabilities, rewrite endpoint, WP-Cron, text domain i18n (Persian RTL) |
 | **WooCommerce** | `bacs` gateway hooks, thank-you/view-order rendering, order meta + status transitions, admin order screen, **HPOS and classic list tables**, `woocommerce_new_order` / `woocommerce_order_status_changed` for alerts |
 | **MySQL (dbDelta)** | `{prefix}wc_bank_receipt_cards`, `_receipt_log`, `_sms_log`, `_transitions`, `_events` with a versioned upgrade path |
-| **`wp_remote_post`** | Outbound SMS to Kavenegar / Melli Payamak / custom HTTP endpoint (disabled in this release) |
+| **`wp_remote_post`** | Outbound SMS to Kavenegar / Melli Payamak / a custom HTTP endpoint, through one pipeline with bounded retries and a redacted delivery log |
 | **Web Audio API** | The admin alert beep — generated in the browser, no audio asset, no network |
 | **jQuery UI sortable** | Drag-to-reorder card priority (persisted via AJAX) |
 | **Enqueued asset files** | `assets/css/frontend.css` (every selector scoped under `.wcrf-panel`, every value a `--wcrf-*` token) and `assets/js/frontend.js` (one IIFE, no globals, no element ids), plus the admin-only `assets/js/admin-appearance.js` — no build step, no dependency, standard `wp_enqueue_*` handles a theme can dequeue |
@@ -241,7 +272,7 @@ WP-Cron (hourly): wc_receipt_cleanup_hook → delete expired files
 
 ```bash
 # install the built package (or upload the same ZIP in wp-admin)
-wp plugin install dist/wc-bank-receipt-7.5.1.zip --activate
+wp plugin install dist/wc-bank-receipt-7.6.0.zip --activate
 ```
 
 1. Activate **WC Bank Receipt Ultimate Control** — the five tables (cards, receipt log, SMS log, transitions, alert events), the protected upload directory and the three hourly crons (cleanup, reminders, expiry) are created automatically. Deactivating the plugin deletes nothing.
@@ -262,8 +293,11 @@ protected file viewing, alert polling — and asserts on the shop's own storage.
 | 7.1.0 (pristine) | **22 pass / 29 fail** | [baseline-run.txt](tests/evidence/baseline-run.txt) |
 | 7.3.0 (alert release) | **51 pass / 0 fail / 0 skip** | [fixed-run.txt](tests/evidence/fixed-run.txt) |
 | 7.3.0 installed from the ZIP | **47 pass / 0 fail** (every group except the slow perf setup) | [installed-package.txt](tests/evidence/installed-package.txt) |
-| **7.4.0 (this release) — all 14 groups** | **77 pass / 0 fail / 0 skip** | [compat-run.txt](tests/evidence/compat-run.txt) |
+| 7.4.0 — all 14 groups | **77 pass / 0 fail / 0 skip** | [compat-run.txt](tests/evidence/compat-run.txt) |
 | **7.4.0 installed from the ZIP** | **73 pass / 0 fail** (every group except the slow perf setup) | [installed-package-7.4.0.txt](tests/evidence/installed-package-7.4.0.txt) |
+| 7.5.0 / 7.5.1 (appearance, then the decision fix) | **91 pass / 0 fail / 0 skip** each | [appearance-7.5.0.txt](tests/evidence/appearance-7.5.0.txt) · [release-7.5.1.txt](tests/evidence/release-7.5.1.txt) |
+| **7.6.0 (this release) — all 18 groups** | **124 pass / 0 fail / 0 skip** | [full-18-groups.txt](tests/evidence/full-18-groups.txt) |
+| **7.6.0 installed from the ZIP** (sec, flow, file, sms, origin, lb, ui) | **59 pass / 0 fail**, schema at DB 7.6.0 with every stored row preserved | [installed-package-7.6.0.txt](tests/evidence/installed-package-7.6.0.txt) |
 
 The same harness file measures **both** builds (it probes for the constants/methods it uses), so the comparison is
 like-for-like. Highlights:
@@ -293,7 +327,18 @@ The 7.5.0 group is `style` (14 checks: the appearance screen and its real `optio
 save, the tokens on the live panel, accent coupling, whitelisted shortcode presets, two
 independent placements on one page, hostile settings input, a page without a panel,
 reset, stylesheet/default parity, capability enforcement, order-data immutability and two
-Elementor instances with different controls) — 91 checks in 15 groups.
+Elementor instances with different controls).
+
+The 7.6.0 groups are `origin` (7 checks: a customer checkout and a customer upload are
+queued, a manager's manual status change and a receipt decision are suppressed, the
+classification context is released even when the callback throws, an unknown origin is
+queued rather than guessed, and the SMS policy still fires for a suppressed event), `lb`
+(9: the shared viewer markup and assets, the streamed file's headers, the 403 for a
+foreign viewer and for a direct file URL, the PDF branch, and the absence of a viewable URL
+for a guest) and `ui` (9: the receipt state model per phase, the alarm contract — repeat
+interval, acknowledgement storage, one-tab lease, bounded option — the viewer colours as
+design tokens, the admin editor's assets and config, and the concrete alarm/lease/ack
+markup) — **124 checks in 18 groups**, all green.
 
 A run takes a lock file, so a
 second suite refuses to start instead of corrupting the first one's evidence.
@@ -303,7 +348,7 @@ second suite refuses to start instead of corrupting the first one's evidence.
 - **One large main file.** `wc-bank-receipt.php` still holds the admin UI, the panel logic, alerts, SMS and cron in a single class (the front-end CSS/JS and the Elementor widget now live in `assets/` and `includes/`); splitting the class into `includes/` modules is the next refactoring step.
 - **No PHPUnit/CI pipeline yet** (see §8): the acceptance harness is integration-level, not a unit-test suite.
 - **No `.pot` translation catalog** despite the text-domain wiring — Persian strings are inline defaults.
-- **SMS is exercised through a simulated HTTP layer**, not with live Kavenegar/Melli Payamak accounts; in this release the SMS UI is off, so the checks assert "nothing is sent" and the delivery-contract checks run only on builds with SMS enabled.
+- **SMS is exercised through a simulated HTTP layer**, not with live Kavenegar/Melli Payamak accounts, so the provider *contract* (payload shape, success judgement, retry classification) is asserted from the plugin's side and from recorded provider answers. The screens are enabled in 7.6.0 and stay silent until the master switch, a provider and a template are configured; the checks assert that silence, the template variable set, the bounded retries and the redaction of stored responses.
 - **Autoplay-blocked sound** is covered by the popup notice, the enable button and the settings switch; the harness asserts the option contract and the popup, while the click-to-enable path was verified in a real browser (see `docs/screenshots/`).
 - **Alert polling is the transport** (10 s default, configurable via filter). It is cheap and CDN-safe; an SSE/WebSocket push layer is deliberately not attempted inside wp-admin.
 - **Appearance layer — verified and not verified.** The 14 `style` checks and the screenshots (`docs/screenshots/09-appearance-styles.png`, `08-customer-upload-form.png`) cover the screen, the save path, presets, the priority order and the injection surface. *Not* measured: Elementor's editor UI (driven through real builder data, not clicked through by hand), **Global Colors / Global Fonts** resolution (reasoned from the control values, not measured against a kit that defines them), script optimisers and caching plugins (not installed), and PHP 7.4 as an execution target (the floor is a syntax scan). A freely chosen palette is also a contrast choice the plugin cannot make for the owner. Details: [`docs/appearance.md`](wc-bank-receipt/docs/appearance.md).
@@ -319,17 +364,12 @@ second suite refuses to start instead of corrupting the first one's evidence.
 ### Roadmap (not implemented yet)
 
 - PHPUnit + CI workflow; `.pot` catalog and English language pack.
-### Roadmap (not implemented yet)
-
 - Split the class into modules (receipts / cards / alerts / SMS / cron).
-- Re-enable the SMS tab (the layer is intact) once its provider contract is re-verified on a live account.
+- Re-verify the SMS provider contract on a live Kavenegar / Melli Payamak account (the pipeline, the retries and the delivery log are already covered against a simulated HTTP layer).
 - Optional alert filters (per status, per payment method) and a persistent "alert history" view.
 
 ## 10. Documentation
 
-| Doc | Contents |
-|---|---|
-| [README.fa.md](README.fa.md) | The Persian version of this document |
 | Doc | Contents |
 |---|---|
 | [README.fa.md](README.fa.md) | The Persian version of this document |
@@ -338,7 +378,8 @@ second suite refuses to start instead of corrupting the first one's evidence.
 | [APPEARANCE-REPORT.md](APPEARANCE-REPORT.md) | Phase report: the appearance layer — fields and defaults, precedence, tokens, CSS loading, tests and what is not verified |
 | [wc-bank-receipt/docs/compatibility.md](wc-bank-receipt/docs/compatibility.md) | Display methods, shortcode and Elementor documentation, CSS/JS isolation contract, compatibility matrix, limitations |
 | [wc-bank-receipt/docs/appearance.md](wc-bank-receipt/docs/appearance.md) | Appearance design tokens, defaults, presets, precedence order, validation and what was tested |
-| [wc-bank-receipt/docs/alerts.md](wc-bank-receipt/docs/alerts.md) | Order-alert event queue, popup, sound and delivery semantics |
+| [wc-bank-receipt/docs/alerts.md](wc-bank-receipt/docs/alerts.md) | Order-alert event queue, origins, repeating popup sound and delivery semantics |
+| [wc-bank-receipt/docs/sms.md](wc-bank-receipt/docs/sms.md) | SMS providers, events, templates and variables, the retry policy and the delivery log |
 | [wc-bank-receipt/docs/state-machine.md](wc-bank-receipt/docs/state-machine.md) | Order/receipt state machine, guards, idempotency, deadlines |
 | [wc-bank-receipt/docs/security-model.md](wc-bank-receipt/docs/security-model.md) | Capabilities, ownership rules, secrets and privacy |
 | [wc-bank-receipt/docs/retention-policy.md](wc-bank-receipt/docs/retention-policy.md) | When receipt files are kept or deleted |
@@ -346,8 +387,6 @@ second suite refuses to start instead of corrupting the first one's evidence.
 | [wc-bank-receipt/docs/troubleshooting-fa.md](wc-bank-receipt/docs/troubleshooting-fa.md) | عیب‌یابی گام‌به‌گام و روش گزارش خطا |
 
 ---
-
-<div align="center">
 
 **More from this portfolio:**
 [hyper_barcode](https://github.com/DeathGunSR/hyper_barcode) ·

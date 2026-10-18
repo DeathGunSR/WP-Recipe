@@ -3,7 +3,7 @@
  * Plugin Name:       WC Bank Receipt Ultimate Control
  * Plugin URI:        https://github.com/DeathGunSR/WP-Recipe
  * Description:       مدیریت فیش بانکی کارت‌به‌کارت ووکامرس: بارگذاری فیش با مهلت، تأیید/رد تکی و گروهی، چرخش کارت‌های بانکی، گالری، گزارش، لاگ، پیامک و شخصی‌سازی ظاهر فرم.
- * Version:           7.5.1
+ * Version:           7.6.0
  * Requires at least: 6.5
  * Requires PHP:      7.4
  * Author:            Alireza
@@ -43,10 +43,10 @@ class WC_Bank_Receipt_Pro {
     const GATEWAY_ID         = 'bacs';
     const UPLOAD_DIR         = 'bank-receipts';
     const DB_PREFIX          = 'wc_bank_receipt_';
-    const DB_VERSION         = '7.5.1';
+    const DB_VERSION         = '7.6.0';
 
     /** Release version — also the cache-busting version of every enqueued asset. */
-    const VERSION            = '7.5.1';
+    const VERSION            = '7.6.0';
 
     /** The public shortcode that renders the receipt panel anywhere. */
     const SHORTCODE          = 'wc_bank_receipt';
@@ -62,6 +62,10 @@ class WC_Bank_Receipt_Pro {
      */
     const ASSET_CSS          = 'assets/css/frontend.css';
     const ASSET_JS           = 'assets/js/frontend.js';
+    // One lightbox for both roles: the same file styles the manager's order screen and the
+    // customer's panel, so what an admin reviews is what the customer saw.
+    const ASSET_LB_CSS       = 'assets/css/lightbox.css';
+    const ASSET_LB_JS        = 'assets/js/lightbox.js';
 
     /*
      * The «ظاهر و استایل» screen reuses the very same panel stylesheet for its live
@@ -76,7 +80,9 @@ class WC_Bank_Receipt_Pro {
      * and stored credentials) is kept intact so the next phase only has to flip
      * this flag and the `wc_receipt_sms_enabled` option back on.
      */
-    const SMS_UI_ENABLED     = false;
+    // Delivery policy: how many times one message may be attempted in total (the first
+    // try plus the retries the retry job is allowed to make).
+    const SMS_MAX_ATTEMPTS   = 3;
 
     /** Alert events are pruned to this many rows / this many days. */
     const ALERT_KEEP_ROWS    = 1000;
@@ -86,6 +92,33 @@ class WC_Bank_Receipt_Pro {
     const ALERT_DEDUPE_WINDOW = 5;
     const CAP_MANAGE         = 'manage_woocommerce';       // single capability used by every mutation
     const NONCE_ADMIN        = 'receipt_admin_nonce';
+
+    /*
+     * EVENT ORIGINS
+     *
+     * Who caused an order status change? WooCommerce answers this question nowhere:
+     * `woocommerce_order_status_changed` fires with ($order_id, $from, $to, $order) — no
+     * actor — and `WC_Order::get_created_via()` describes how the ORDER was created, not
+     * who changed it afterwards. `is_admin()`/`current_user_can()` are request facts, not
+     * provenance, and on their own they misclassify cron, REST and the plugin's own
+     * internal transitions.
+     *
+     * So the origin is decided from three sources, in this order:
+     *   1. an explicit context this plugin sets around its own transitions (most reliable);
+     *   2. the request itself — cron/CLI, then a capable user driving a wp-admin/REST call;
+     *   3. the order's own `created_via` (checkout / store-api) for customer flows.
+     * Anything left over is `unknown`: it is never attributed to the admin, it is queued
+     * (a real event must not be lost) and its origin is stored so an unexpected case can
+     * be diagnosed instead of guessed.
+     */
+    const ORIGIN_CUSTOMER_CHECKOUT = 'customer_checkout';
+    const ORIGIN_CUSTOMER_UPLOAD   = 'customer_receipt_upload';
+    const ORIGIN_ADMIN_MANUAL      = 'admin_manual_action';
+    const ORIGIN_ADMIN_REVIEW      = 'admin_receipt_review';
+    const ORIGIN_PAYMENT_GATEWAY   = 'payment_gateway';
+    const ORIGIN_SYSTEM            = 'system_automation';
+    const ORIGIN_PLUGIN_INTERNAL   = 'plugin_internal';
+    const ORIGIN_UNKNOWN           = 'unknown';
     const SMS_PROVIDERS      = array(
         'kavenegar' => 'کاوه‌نگار',
         'melli'     => 'ملی پیامک',
@@ -127,6 +160,29 @@ class WC_Bank_Receipt_Pro {
      * (see refresh_new_order_snapshots()).
      */
     private static $alert_new_order_rows = array();
+
+    /**
+     * Orders for which a receipt event already sent (or claimed) its own SMS during this
+     * request.
+     *
+     * Deciding a receipt also moves the order's status, and the customer must not receive
+     * two messages for one action: when this flag is set for an order, the generic
+     * per-status message stands down for it. Request-scoped on purpose — the durable
+     * guarantee is the claim ledger inside sms_send_event(), which survives concurrency.
+     */
+    private static $sms_handled_orders = array();
+
+    /**
+     * Explicit origin context for the transitions the plugin performs itself.
+     *
+     * A stack, not a flag: approve calls payment_complete(), which fires the very hooks
+     * that queue alerts, and a nested operation must restore — not clear — the outer
+     * context. Every begin is paired with an end in a `finally`, so a thrown error can
+     * never leave the context set and silently swallow later alerts.
+     *
+     * @var string[]
+     */
+    private static $origin_stack = array();
 
     /**
      * FIX #1 – Context flag.
@@ -182,6 +238,11 @@ class WC_Bank_Receipt_Pro {
 
         add_action( 'woocommerce_order_status_changed',
                     array( $this, 'send_sms_on_status_change' ), 10, 4 );
+        add_action( 'woocommerce_new_order',
+                    array( $this, 'send_sms_on_new_order' ), 30, 2 );
+        // Retries run on their own single event, scheduled only for a transient failure.
+        add_action( 'wc_receipt_sms_retry_hook', array( $this, 'sms_retry_due' ) );
+        add_action( 'wp_ajax_wcr_sms_preview',   array( $this, 'ajax_sms_preview' ) );
 
         add_action( 'init',              array( $this, 'add_rewrite_endpoint' ) );
         add_action( 'template_redirect', array( $this, 'secure_receipt_view'  ) );
@@ -233,8 +294,20 @@ class WC_Bank_Receipt_Pro {
     // =========================================================================
 
     public function admin_enqueue_assets( $hook ) {
-        if ( strpos( $hook, 'wc-receipt' ) === false &&
-             strpos( $hook, 'wc-sms'     ) === false ) return;
+        $plugin_screen = ( strpos( $hook, 'wc-receipt' ) !== false || strpos( $hook, 'wc-sms' ) !== false );
+
+        if ( ! $plugin_screen ) {
+            /*
+             * The order screen also shows a receipt — but it is WooCommerce's screen, not
+             * ours, so only the viewer ships there. Same component, same authorisation
+             * (the URL is minted by receipt_view_url()), no plugin chrome injected into
+             * another plugin's page.
+             */
+            if ( $this->is_order_admin_screen( $hook ) ) {
+                self::enqueue_lightbox_assets();
+            }
+            return;
+        }
 
         wp_enqueue_script( 'jquery-ui-sortable' );
 
@@ -306,8 +379,66 @@ class WC_Bank_Receipt_Pro {
     /** Enqueue both handles — used by the automatic hooks and by on-demand rendering. */
     public static function enqueue_frontend_assets() {
         self::register_frontend_assets();
+        self::register_lightbox_assets();
         wp_enqueue_style( 'wcr-frontend' );
         wp_enqueue_script( 'wcr-frontend' );
+        // The panel can show the receipt it received; the viewer ships with the panel.
+        wp_enqueue_style( 'wcr-lightbox' );
+        wp_enqueue_script( 'wcr-lightbox' );
+    }
+
+    /**
+     * Is this the WooCommerce order editing screen (legacy CPT or HPOS)?
+     *
+     * Determined from the admin hook plus the query the hook came with — never from a bare
+     * capability, so a manager on any other screen gets nothing.
+     */
+    private function is_order_admin_screen( $hook ) {
+        if ( ! current_user_can( self::CAP_MANAGE ) ) return false;
+
+        // Legacy CPT order editor (post.php) and its "add new" sibling.
+        if ( in_array( $hook, array( 'post.php', 'post-new.php' ), true ) ) {
+            $type = isset( $_GET['post_type'] ) ? sanitize_key( wp_unslash( $_GET['post_type'] ) ) : '';
+            $post = isset( $_GET['post'] ) ? absint( wp_unslash( $_GET['post'] ) ) : 0;
+            if ( 'shop_order' === $type ) return true;
+            if ( $post && 'shop_order' === get_post_type( $post ) ) return true;
+            return false;
+        }
+
+        // HPOS: WooCommerce → Orders, list or single order (page=wc-orders&action=edit).
+        if ( 'woocommerce_page_wc-orders' === $hook ) return true;
+
+        return false;
+    }
+
+    /**
+     * Register (once) the shared receipt viewer.
+     *
+     * Loaded by the front-end panel and by the admin screens that show a receipt, so there
+     * is a single implementation of the overlay, the keyboard handling and the PDF frame.
+     */
+    public static function register_lightbox_assets() {
+        if ( wp_style_is( 'wcr-lightbox', 'registered' ) ) return;
+
+        wp_register_style( 'wcr-lightbox', plugins_url( self::ASSET_LB_CSS, __FILE__ ), array(), self::VERSION );
+        wp_register_script( 'wcr-lightbox', plugins_url( self::ASSET_LB_JS, __FILE__ ), array(), self::VERSION, true );
+        wp_localize_script(
+            'wcr-lightbox',
+            'wcrLightbox',
+            array(
+                'close'   => __( 'بستن', 'wc-bank-receipt' ),
+                'openNew' => __( 'بازکردن در زبانهٔ جدید', 'wc-bank-receipt' ),
+                'missing' => __( 'فایل رسید در دسترس نیست یا دسترسی به آن مجاز نیست.', 'wc-bank-receipt' ),
+                'hint'    => __( 'برای بستن، بیرون تصویر کلیک کنید یا کلید Esc را بزنید.', 'wc-bank-receipt' ),
+            )
+        );
+    }
+
+    /** Enqueue the viewer only (admin order screen, gallery). */
+    public static function enqueue_lightbox_assets() {
+        self::register_lightbox_assets();
+        wp_enqueue_style( 'wcr-lightbox' );
+        wp_enqueue_script( 'wcr-lightbox' );
     }
 
     /**
@@ -490,21 +621,12 @@ class WC_Bank_Receipt_Pro {
 .wcr-ginfo .time-left{font-size:12px;color:var(--wcr-muted);margin-top:3px;}
 .wcr-ginfo .actions{margin-top:10px;display:flex;gap:8px;}
 
-/* ---- Lightbox ---- */
-.wcr-lightbox{
-  display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);
-  z-index:999999;align-items:center;justify-content:center;
-  backdrop-filter:blur(4px);
-}
-.wcr-lightbox.open{display:flex;}
-.wcr-lightbox img{max-width:90%;max-height:88%;border-radius:10px;box-shadow:0 20px 60px rgba(0,0,0,.5);}
-.wcr-lb-close{
-  position:absolute;top:18px;right:18px;color:#fff;cursor:pointer;
-  background:rgba(255,255,255,.2);width:40px;height:40px;border-radius:50%;
-  display:flex;align-items:center;justify-content:center;transition:var(--wcr-tr);
-  font-size:20px;border:none;
-}
-.wcr-lb-close:hover{background:rgba(255,255,255,.35);}
+/* ---- Lightbox ----
+ * The overlay itself now lives in assets/css/lightbox.css, shared with the customer
+ * panel: one implementation, one behaviour, and no second copy to keep in sync here.
+ * Only the admin trigger needs a nudge so it reads as clickable. */
+a[data-wcr-lb]{cursor:zoom-in;}
+a.wcr-btn[data-wcr-lb]{cursor:zoom-in;}
 
 /* ---- SMS Log ---- */
 .wcr-log-sent{color:var(--wcr-ok);}
@@ -554,6 +676,24 @@ class WC_Bank_Receipt_Pro {
   display:inline-block;font-size:12px;direction:ltr;
   font-family:monospace;letter-spacing:2px;
 }
+
+/* ---- Element editor (appearance preview) ---- */
+.wcr-el-editor{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px;align-items:start;}
+@media(max-width:1100px){.wcr-el-editor{grid-template-columns:1fr;}}
+.wcr-el-stage{min-width:0;}
+.wcr-el-stage [data-wcr-el]{cursor:pointer;position:relative;}
+.wcr-el-stage [data-wcr-el]:hover{outline:2px dashed rgba(30,136,229,.55);outline-offset:2px;}
+.wcr-el-stage [data-wcr-el].is-selected{outline:2px solid var(--wcr-primary-h);outline-offset:2px;}
+.wcr-el-panel{background:var(--wcr-white);border:1.5px solid var(--wcr-border);border-radius:var(--wcr-r);padding:16px 18px;box-shadow:var(--wcr-sh);position:sticky;top:40px;}
+.wcr-el-panel-title{margin:0 0 10px;font-size:14px;color:var(--wcr-text);}
+.wcr-el-empty{margin:0;font-size:13px;color:var(--wcr-muted);line-height:1.8;}
+.wcr-el-name{margin:0 0 12px;font-weight:600;font-size:13px;color:var(--wcr-primary);}
+.wcr-el-row{display:grid;grid-template-columns:1fr 92px auto;gap:8px;align-items:center;margin-bottom:9px;}
+.wcr-el-label{font-size:12px;color:var(--wcr-text);}
+.wcr-el-input{width:100%;min-width:0;padding:5px 7px;border:1.5px solid var(--wcr-border);border-radius:6px;font-size:12px;background:#fafafa;height:auto;line-height:1.4;}
+.wcr-el-input[type=color]{padding:0;height:30px;}
+.wcr-el-clear{padding:4px 8px !important;font-size:11px !important;}
+.wcr-el-actions{margin:12px 0 6px;}
 
 /* ---- Reset button ---- */
 .wcr-reset-btn{
@@ -696,6 +836,11 @@ class WC_Bank_Receipt_Pro {
             KEY order_id (order_id)
         ) $cc;" );
 
+        // SMS delivery log. The columns after `response` turn a one-line history into a
+        // diagnosable ledger (which event, which provider, how many attempts, which HTTP
+        // code, the provider's own message id, and when the next retry is due). dbDelta adds
+        // them to an existing installation without touching a single row — which matters:
+        // this table is the shop's record of what it sent.
         dbDelta( "CREATE TABLE {$prefix}sms_log (
             id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
             order_id bigint(20) unsigned DEFAULT NULL,
@@ -704,8 +849,21 @@ class WC_Bank_Receipt_Pro {
             status varchar(20) NOT NULL DEFAULT 'sent',
             response text DEFAULT NULL,
             timestamp datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            event varchar(40) NOT NULL DEFAULT '',
+            provider varchar(20) NOT NULL DEFAULT '',
+            attempts int(11) unsigned NOT NULL DEFAULT 0,
+            event_key char(40) NOT NULL DEFAULT '',
+            http_code int(11) NOT NULL DEFAULT 0,
+            provider_id varchar(100) NOT NULL DEFAULT '',
+            next_attempt datetime DEFAULT NULL,
+            sent_at datetime DEFAULT NULL,
+            created_at datetime DEFAULT NULL,
+            updated_at datetime DEFAULT NULL,
             PRIMARY KEY (id),
-            KEY order_id (order_id)
+            KEY order_id (order_id),
+            KEY status (status),
+            KEY event (event),
+            KEY event_key (event_key)
         ) $cc;" );
 
         // Idempotency ledger: one row per (order, receipt file, transition).
@@ -742,13 +900,16 @@ class WC_Bank_Receipt_Pro {
             items_count int(11) unsigned NOT NULL DEFAULT 0,
             view_url varchar(255) NOT NULL DEFAULT '',
             user_id bigint(20) unsigned NOT NULL DEFAULT 0,
+            origin varchar(30) NOT NULL DEFAULT '',
+            suppressed tinyint(1) NOT NULL DEFAULT 0,
             created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             created_gmt datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             dedupe_key char(40) NOT NULL,
             PRIMARY KEY (id),
             UNIQUE KEY uniq_event (dedupe_key),
             KEY order_id (order_id),
-            KEY created_gmt (created_gmt)
+            KEY created_gmt (created_gmt),
+            KEY suppressed_id (suppressed, id)
         ) $cc;" );
     }
 
@@ -852,21 +1013,20 @@ class WC_Bank_Receipt_Pro {
             'manage_woocommerce', 'wc-receipt-gallery', array( $this, 'gallery_page' ) );
 
         /*
-         * SMS screens are not registered in this release (see SMS_UI_ENABLED).
-         * Not registering the menu page also removes the route: WordPress answers
-         * `admin.php?page=wc-sms-settings` with “Sorry, you are not allowed to access
-         * this page.” for everyone, including an administrator. No option, table or
-         * credential is touched — the pages come back with the flag in the next phase.
+         * SMS screens.
+         *
+         * SMS is a real feature now, so both screens are registered and reachable. Both
+         * callbacks re-check the capability themselves (`manage_woocommerce`), and the
+         * master switch (`wc_sms_enabled`, off by default) is what decides whether a
+         * message can leave the shop — the menu does not gate the settings.
          */
-        if ( self::SMS_UI_ENABLED ) {
-            add_submenu_page( 'wc-receipt-settings',
-                __( 'پیام‌رسانی', 'wc-bank-receipt' ), __( 'پیام‌رسانی', 'wc-bank-receipt' ),
-                'manage_options', 'wc-sms-settings', array( $this, 'sms_settings_page' ) );
+        add_submenu_page( 'wc-receipt-settings',
+            __( 'پیام‌رسانی', 'wc-bank-receipt' ), __( 'پیام‌رسانی', 'wc-bank-receipt' ),
+            'manage_woocommerce', 'wc-sms-settings', array( $this, 'sms_settings_page' ) );
 
-            add_submenu_page( 'wc-receipt-settings',
-                __( 'لاگ پیامک', 'wc-bank-receipt' ), __( 'لاگ پیامک', 'wc-bank-receipt' ),
-                'manage_options', 'wc-sms-log', array( $this, 'sms_log_page' ) );
-        }
+        add_submenu_page( 'wc-receipt-settings',
+            __( 'تاریخچه پیامک', 'wc-bank-receipt' ), __( 'تاریخچه پیامک', 'wc-bank-receipt' ),
+            'manage_woocommerce', 'wc-sms-log', array( $this, 'sms_log_page' ) );
     }
 
     // =========================================================================
@@ -884,6 +1044,7 @@ class WC_Bank_Receipt_Pro {
         // Order alerts (popup + sound). Sound is the only part that is optional; the
         // visual alert is always queued for whoever may manage orders.
         register_setting( 'wc_receipt_group', 'wc_receipt_alerts_sound', array( $this, 'sanitize_yes_no' ) );
+        register_setting( 'wc_receipt_group', 'wc_receipt_alerts_repeat', array( $this, 'sanitize_alert_repeat' ) );
 
         /*
          * Appearance: one option in its own options group.
@@ -927,9 +1088,33 @@ class WC_Bank_Receipt_Pro {
                 $k === 'custom_url' ? 'esc_url_raw' : ( $k === 'reminder_before_hours' ? 'absint' : 'sanitize_text_field' ) );
         }
 
-        foreach ( array( 'approved','rejected','reminder','cancelled','admin_upload' ) as $t ) {
-            register_setting( 'wc_sms_group', "wc_sms_{$t}_tpl",    'sanitize_text_field' );
+        // The master switch ships as “no”: nothing is sent until the owner turns SMS on.
+        register_setting( 'wc_sms_group', 'wc_sms_enabled', array( $this, 'sanitize_yes_no' ) );
+
+        /*
+         * One switch and one template per event.
+         *
+         * Templates are sanitized as *textarea* text, not as a single line: a message with
+         * an intentional line break must survive the round-trip, and sanitize_text_field()
+         * would silently collapse it. The placeholder syntax is plain text to WordPress, so
+         * it passes through untouched.
+         */
+        $sms_events = array( 'approved', 'rejected', 'reminder', 'cancelled', 'admin_upload', 'new_order' );
+        foreach ( $sms_events as $t ) {
+            register_setting( 'wc_sms_group', "wc_sms_{$t}_tpl",     'sanitize_textarea_field' );
             register_setting( 'wc_sms_group', "wc_sms_{$t}_sender",  'sanitize_text_field' );
+            register_setting( 'wc_sms_group', "wc_sms_{$t}_enabled", array( $this, 'sanitize_yes_no' ) );
+        }
+
+        // …plus the per-status pair (switch + template) for every status WooCommerce knows.
+        register_setting( 'wc_sms_group', 'wc_sms_status_tpl', 'sanitize_textarea_field' );
+        if ( function_exists( 'wc_get_order_statuses' ) ) {
+            foreach ( array_keys( wc_get_order_statuses() ) as $status_key ) {
+                $slug = self::normalize_status( $status_key );
+                if ( '' === $slug ) continue;
+                register_setting( 'wc_sms_group', $this->sms_status_option( $slug, 'tpl' ),     'sanitize_textarea_field' );
+                register_setting( 'wc_sms_group', $this->sms_status_option( $slug, 'enabled' ), array( $this, 'sanitize_yes_no' ) );
+            }
         }
     }
 
@@ -937,6 +1122,14 @@ class WC_Bank_Receipt_Pro {
         if ( ! is_array( $input ) ) return array();
         $allowed = array( 'image/jpeg', 'image/png', 'application/pdf' );
         return array_values( array_intersect( array_map( 'sanitize_mime_type', $input ), $allowed ) );
+    }
+
+    /** Repeat interval of the alarm, in seconds. Clamped to what the popup can honour. */
+    public function sanitize_alert_repeat( $input ) {
+        $seconds = absint( $input );
+        if ( $seconds < 3 )  $seconds = 3;
+        if ( $seconds > 300 ) $seconds = 300;
+        return $seconds;
     }
 
     public function sanitize_yes_no( $input ) {
@@ -1071,6 +1264,13 @@ class WC_Bank_Receipt_Pro {
                                     <?php esc_html_e( 'پخش صدای هشدار برای سفارش جدید و تغییر وضعیت سفارش', 'wc-bank-receipt' ); ?>
                                 </label>
                                 <p class="wcr-hint"><?php esc_html_e( 'اعلان تصویری همیشه برای کاربران دارای دسترسی مدیریت سفارش نمایش داده می‌شود؛ این گزینه فقط صدا را خاموش یا روشن می‌کند. صدا از داخل مرورگر ساخته می‌شود و به فایل یا اینترنت وابسته نیست.', 'wc-bank-receipt' ); ?></p>
+                                <p class="wcr-hint">
+                                    <label for="wc_receipt_alerts_repeat"><?php esc_html_e( 'فاصله تکرار هشدار (ثانیه):', 'wc-bank-receipt' ); ?></label>
+                                    <input type="number" min="3" max="300" step="1" id="wc_receipt_alerts_repeat"
+                                           name="wc_receipt_alerts_repeat" style="max-width:90px;"
+                                           value="<?php echo esc_attr( (int) get_option( 'wc_receipt_alerts_repeat', 12 ) ); ?>">
+                                    <?php esc_html_e( '— صدای هشدار تا بسته‌شدن اعلان با این فاصله تکرار می‌شود (۳ تا ۳۰۰).', 'wc-bank-receipt' ); ?>
+                                </p>
                                 <p>
                                     <button type="button" class="button" id="wcr-test-sound"><?php esc_html_e( 'آزمون صدا', 'wc-bank-receipt' ); ?></button>
                                     <span class="wcr-hint" id="wcr-test-sound-msg" aria-live="polite"></span>
@@ -1121,39 +1321,40 @@ class WC_Bank_Receipt_Pro {
             document.getElementById('custom_days_row').style.display = this.value==='custom' ? '' : 'none';
         });
 
-        // Test button: the same locally generated beep the order popup uses. A click is
-        // also the user gesture a browser with blocked autoplay is waiting for.
+        /*
+         * Test button.
+         *
+         * It plays the ALARM ITSELF, through the engine the order popup exposes as
+         * window.WCR_ALERT_SOUND — not a second, hand-written copy of the oscillator that
+         * would drift apart from what a real alert sounds like. The popup script is printed
+         * in the admin footer, so the global is looked up at click time, never at parse
+         * time; the fallback text covers the case where it is not there at all (a manager
+         * without the alert capability, or a script blocked by another plugin).
+         */
         (function(){
             var btn = document.getElementById('wcr-test-sound');
             var msg = document.getElementById('wcr-test-sound-msg');
             if (!btn) return;
+            var L = {
+                unsupported: '<?php echo esc_js( __( 'مرورگر شما از پخش صدا پشتیبانی نمی‌کند.', 'wc-bank-receipt' ) ); ?>',
+                played:      '<?php echo esc_js( __( 'صدای آزمایشی پخش شد.', 'wc-bank-receipt' ) ); ?>',
+                blocked:     '<?php echo esc_js( __( 'مرورگر پخش خودکار را مسدود کرده است؛ یک بار روی صفحه کلیک کنید و دوباره بیازمایید.', 'wc-bank-receipt' ) ); ?>',
+                off:         '<?php echo esc_js( __( 'صدا در تنظیمات خاموش است.', 'wc-bank-receipt' ) ); ?>',
+                unavailable: '<?php echo esc_js( __( 'موتور صدا در این صفحه بارگذاری نشده است؛ تنظیمات را ذخیره کنید و صفحه پیشخوان را دوباره باز کنید.', 'wc-bank-receipt' ) ); ?>'
+            };
             btn.addEventListener('click', function(){
-                var Ctx = window.AudioContext || window.webkitAudioContext;
-                if (!Ctx) {
-                    msg.textContent = '<?php echo esc_js( __( 'مرورگر شما از پخش صدا پشتیبانی نمی‌کند.', 'wc-bank-receipt' ) ); ?>';
+                var engine = window.WCR_ALERT_SOUND;
+                if (!engine || typeof engine.test !== 'function') {
+                    msg.textContent = L.unavailable;
                     return;
                 }
-                try {
-                    var ctx = new Ctx();
-                    if (ctx.state === 'suspended') { ctx.resume(); }
-                    var t = ctx.currentTime;
-                    var gain = ctx.createGain();
-                    gain.connect(ctx.destination);
-                    gain.gain.setValueAtTime(0.0001, t);
-                    gain.gain.exponentialRampToValueAtTime(0.22, t + 0.05);
-                    gain.gain.exponentialRampToValueAtTime(0.0001, t + 1.05);
-                    [880, 660].forEach(function(freq, i){
-                        var osc = ctx.createOscillator();
-                        osc.type = 'sine';
-                        osc.frequency.value = freq;
-                        osc.connect(gain);
-                        osc.start(t + i * 0.16);
-                        osc.stop(t + 1.05);
-                    });
-                    msg.textContent = '<?php echo esc_js( __( 'صدای آزمایشی پخش شد.', 'wc-bank-receipt' ) ); ?>';
-                } catch (e) {
-                    msg.textContent = '<?php echo esc_js( __( 'پخش صدا در این مرورگر ممکن نشد.', 'wc-bank-receipt' ) ); ?>';
-                }
+                // The engine follows the SAVED option; an unsaved checkbox would otherwise
+                // look broken. Say so instead of playing (or refusing) the wrong thing.
+                var box = document.querySelector('input[name="wc_receipt_alerts_sound"]');
+                if (box && !box.checked) { msg.textContent = L.off; return; }
+                var result = engine.test();
+                msg.textContent = result === 'played' ? L.played
+                    : (result === 'off' ? L.off : (result === 'blocked' ? L.blocked : L.unsupported));
             });
         })();
         </script>
@@ -1546,6 +1747,9 @@ class WC_Bank_Receipt_Pro {
             'is_gateway'    => false,
             'has_receipt'   => false,
             'state'         => '',
+            'phase'         => 'awaiting_payment',
+            'show_card'     => false,
+            'show_timer'    => false,
             'reject_reason' => '',
             'card'          => null,
             'remaining'     => 0,
@@ -1577,28 +1781,62 @@ class WC_Bank_Receipt_Pro {
         $ctx['reject_reason'] = (string) $order->get_meta( self::META_REJECT_REASON );
         $ctx['closed']        = in_array( $order->get_status(), array( 'failed', 'cancelled' ), true );
 
+        /*
+         * THE PHASE — one derivation, four answers.
+         *
+         * Every visibility rule below (card, countdown, upload form) is read off this
+         * single value instead of being re-guessed in the markup, so the customer can
+         * never see a contradiction such as a countdown for a receipt that is already in
+         * the review queue, or a card number again after they paid.
+         *
+         *   awaiting_payment — nothing uploaded (or the file is gone) and still in time:
+         *                      card + countdown + upload form.
+         *   under_review     — a receipt is queued for review: status box + view,
+         *                      NO countdown (the deadline no longer belongs to the customer),
+         *                      no card and no form.
+         *   rejected         — a decision was made: reason + the old receipt, plus a fresh
+         *                      deadline/card/form so the payment can be corrected.
+         *   approved         — the decision panel only.
+         */
+        $ctx['phase'] = $this->receipt_phase( $ctx['state'], $ctx['has_receipt'] );
+
         // Merely reading the panel never mutates the order: the deadline is an
         // absolute timestamp and the scheduled job owns expiry.
-        $expire_hours     = $this->expire_hours();
-        $ctx['unlimited'] = ( $expire_hours <= 0 );
-        $ctx['total']     = (int) round( $expire_hours * HOUR_IN_SECONDS );
-        $ctx['remaining'] = $this->remaining_seconds( $order );
-        if ( $ctx['total'] > 0 ) {
-            $ctx['progress'] = (int) min( 100, max( 0, round( ( $ctx['remaining'] / $ctx['total'] ) * 100 ) ) );
+        $ctx['show_timer'] = ( ! $ctx['closed'] && in_array( $ctx['phase'], array( 'awaiting_payment', 'rejected' ), true ) );
+        $ctx['total']      = 0;
+        $ctx['remaining']  = 0;
+        $ctx['progress']   = 0;
+        if ( $ctx['show_timer'] ) {
+            $expire_hours     = $this->expire_hours();
+            $ctx['unlimited'] = ( $expire_hours <= 0 );
+            $ctx['total']     = (int) round( $expire_hours * HOUR_IN_SECONDS );
+            $ctx['remaining'] = $this->remaining_seconds( $order );
+            if ( $ctx['total'] > 0 && $ctx['remaining'] >= 0 ) {
+                $ctx['progress'] = (int) min( 100, max( 0, round( ( $ctx['remaining'] / $ctx['total'] ) * 100 ) ) );
+            }
+        } else {
+            $ctx['unlimited'] = ( $this->expire_hours() <= 0 );
         }
 
-        // Use the card already assigned to this order (if any), else the active card.
-        $assigned = absint( $order->get_meta( self::META_ASSIGNED_CARD ) );
-        $card     = $assigned ? $this->get_card_by_id( $assigned ) : $this->get_active_card();
-        if ( $card && ! $this->card_is_usable( $card ) ) {
-            $card = $assigned ? $this->get_active_card() : $card; // never show a dead card
-        }
-        if ( ! $card && ! $ctx['has_receipt'] ) {
-            $card = $this->get_active_card();
-        }
-        $ctx['card'] = $card;
+        $ctx['show_card'] = ( ! $ctx['closed'] && in_array( $ctx['phase'], array( 'awaiting_payment', 'rejected' ), true ) );
 
-        $ctx['show_upload'] = ( ( ! $ctx['has_receipt'] || 'rejected' === $ctx['state'] )
+        if ( $ctx['show_card'] ) {
+            // Use the card already assigned to this order (if any), else the active card.
+            // A rejected receipt keeps its own card: the retry must go to the same
+            // collection path, not to whatever card happens to be active now.
+            $assigned = absint( $order->get_meta( self::META_ASSIGNED_CARD ) );
+            $card     = $assigned ? $this->get_card_by_id( $assigned ) : $this->get_active_card();
+            if ( $card && ! $this->card_is_usable( $card ) ) {
+                $card = $assigned ? $this->get_active_card() : $card; // never show a dead card
+            }
+            if ( ! $card ) {
+                $card = $this->get_active_card();
+            }
+            $ctx['card'] = $card;
+        }
+
+        $ctx['show_upload'] = ( ! $ctx['closed']
+                                && in_array( $ctx['phase'], array( 'awaiting_payment', 'rejected' ), true )
                                 && ( $ctx['unlimited'] || $ctx['remaining'] > 0 ) );
 
         if ( $ctx['show_upload'] ) {
@@ -1609,6 +1847,26 @@ class WC_Bank_Receipt_Pro {
         }
 
         return apply_filters( 'wcr_receipt_panel_context', $ctx, $order, $args );
+    }
+
+    /**
+     * The single business phase of an order's receipt, from its stored state and whether a
+     * file is actually reachable.
+     *
+     * A state without a file (the row was cleaned up by the retention policy, or the
+     * upload half-failed) is NOT “under review”: telling a customer their payment is being
+     * reviewed when there is nothing to review would be a lie. Such an order falls back to
+     * the payment phase, where the customer can upload again.
+     *
+     * @param string $state      Stored receipt state ('', pending_review, approved, rejected).
+     * @param bool   $has_receipt Whether the file really exists.
+     * @return string awaiting_payment | under_review | rejected | approved
+     */
+    private function receipt_phase( $state, $has_receipt ) {
+        if ( 'approved' === $state ) return 'approved';
+        if ( 'rejected' === $state && $has_receipt ) return 'rejected';
+        if ( 'pending_review' === $state && $has_receipt ) return 'under_review';
+        return 'awaiting_payment';
     }
 
     /** @internal array_map helper for the `accept` attribute. */
@@ -1701,7 +1959,7 @@ class WC_Bank_Receipt_Pro {
             wc_print_notices();
         }
 
-        if ( 'approved' === $ctx['state'] ) {
+        if ( 'approved' === $ctx['phase'] ) {
             ?>
             <div class="wcrf-status-box approved">
                 <div class="wcrf-status-title">✅ <?php esc_html_e( 'واریز تأیید شد', 'wc-bank-receipt' ); ?></div>
@@ -1718,7 +1976,7 @@ class WC_Bank_Receipt_Pro {
             echo '<div class="wcrf-no-card">⚠️ ' . esc_html__( 'در حال حاضر حساب بانکی فعالی برای واریز وجود ندارد. با مدیریت تماس بگیرید.', 'wc-bank-receipt' ) . '</div>';
         }
 
-        if ( $ctx['remaining'] > 0 ) {
+        if ( $ctx['show_timer'] && $ctx['remaining'] > 0 ) {
             /*
              * The initial countdown is rendered server-side instead of an ASCII "--:--:--"
              * placeholder: the number is real, so there is no empty flash before the script
@@ -1739,21 +1997,28 @@ class WC_Bank_Receipt_Pro {
             <?php
         }
 
-        if ( $ctx['has_receipt'] ) {
-            if ( 'rejected' === $ctx['state'] ) {
-                echo '<div class="wcrf-status-box rejected">';
-                echo '<div class="wcrf-status-title">❌ ' . esc_html__( 'فیش رد شد', 'wc-bank-receipt' ) . '</div>';
-                if ( '' !== $ctx['reject_reason'] ) {
-                    echo '<div class="wcrf-reject-reason">' . esc_html( $ctx['reject_reason'] ) . '</div>';
-                }
-                $this->receipt_view_affordance( $order, __( 'مشاهده فیش قبلی', 'wc-bank-receipt' ) );
-                echo '</div>';
-            } else {
-                echo '<div class="wcrf-status-box pending">';
-                echo '<div class="wcrf-status-title">⏳ ' . esc_html__( 'در انتظار بررسی مدیریت', 'wc-bank-receipt' ) . '</div>';
-                $this->receipt_view_affordance( $order, __( 'مشاهده فیش ارسالی', 'wc-bank-receipt' ) );
-                echo '</div>';
+        if ( 'rejected' === $ctx['phase'] ) {
+            echo '<div class="wcrf-status-box rejected">';
+            echo '<div class="wcrf-status-title">❌ ' . esc_html__( 'فیش رد شد', 'wc-bank-receipt' ) . '</div>';
+            if ( '' !== $ctx['reject_reason'] ) {
+                echo '<div class="wcrf-reject-reason">' . esc_html( $ctx['reject_reason'] ) . '</div>';
             }
+            $this->receipt_view_affordance( $order, __( 'مشاهده فیش قبلی', 'wc-bank-receipt' ) );
+            echo '</div>';
+        } elseif ( 'under_review' === $ctx['phase'] ) {
+            echo '<div class="wcrf-status-box pending">';
+            echo '<div class="wcrf-status-title">⏳ ' . esc_html__( 'در انتظار بررسی مدیریت', 'wc-bank-receipt' ) . '</div>';
+            echo '<div class="wcrf-status-note">' . esc_html__( 'فیش شما دریافت شد؛ پس از تأیید، نتیجه به شما اطلاع داده می‌شود.', 'wc-bank-receipt' ) . '</div>';
+            $this->receipt_view_affordance( $order, __( 'مشاهده فیش ارسالی', 'wc-bank-receipt' ) );
+            echo '</div>';
+        } elseif ( $ctx['has_receipt'] && 'awaiting_payment' === $ctx['phase'] ) {
+            // A file exists but the receipt is neither in review nor approved — e.g. the
+            // retention policy removed it, or the decision was reversed by hand. Say so
+            // plainly instead of showing a state the server cannot back up.
+            echo '<div class="wcrf-status-box pending">';
+            echo '<div class="wcrf-status-title">ℹ️ ' . esc_html__( 'وضعیت فیش این سفارش در حال بررسی است', 'wc-bank-receipt' ) . '</div>';
+            $this->receipt_view_affordance( $order, __( 'مشاهده فایل رسید', 'wc-bank-receipt' ) );
+            echo '</div>';
         }
 
         if ( $ctx['show_upload'] ) {
@@ -1789,13 +2054,16 @@ class WC_Bank_Receipt_Pro {
      * hand-written copy that would drift: one markup source for the live panel and the
      * preview. It owns no logic and prints nothing else.
      *
-     * @param object $card Row of the cards table.
+     * @param object $card            Row of the cards table.
+     * @param string $preview_element Optional element key for the visual editor. Only the
+     *                                editor passes it, so the customer's markup stays clean.
      * @return string
      */
-    private function bank_card_markup( $card ) {
+    private function bank_card_markup( $card, $preview_element = '' ) {
+        $el = ( '' !== $preview_element ) ? ' data-wcr-el="' . esc_attr( $preview_element ) . '"' : '';
         ob_start();
         ?>
-        <div class="wcrf-bank-card">
+        <div class="wcrf-bank-card"<?php echo $el; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped above. ?>>
             <div class="bank-header">
                 <div class="bank-name">🏦 <?php echo esc_html( $card->bank_name ); ?></div>
                 <div class="card-logo" aria-hidden="true">💳</div>
@@ -1825,7 +2093,7 @@ class WC_Bank_Receipt_Pro {
      * @param array $ctx Panel context (or an equivalent array when previewing).
      * @return string
      */
-    private function drop_zone_markup( $ctx ) {
+    private function drop_zone_markup( $ctx, $preview_element = '' ) {
         ob_start();
         ?>
         <div class="wcrf-drop-zone">
@@ -2099,9 +2367,15 @@ class WC_Bank_Receipt_Pro {
     /**
      * Apply a receipt/order transition.
      *
+     * The whole transition runs inside an explicit origin context, because every branch
+     * below changes the order status through WooCommerce and therefore fires the very
+     * hooks that queue the admin alerts. Without that context the plugin would alert an
+     * admin about the status change the admin just requested, and about the upload the
+     * customer just made it “look” like a manager action.
+     *
      * @param WC_Order|int $order      Order object or id.
      * @param string       $transition upload|approve|reject|expire
-     * @param array        $args       upload: file, card_id | reject: reason
+     * @param array        $args       upload: file, card_id | reject: reason | origin: override
      * @return array{ok:bool,code:string,message:string}
      */
     public function apply_transition( $order, $transition, $args = array() ) {
@@ -2111,6 +2385,54 @@ class WC_Bank_Receipt_Pro {
         if ( ! $order ) {
             return $this->transition_result( false, 'no_order', __( 'سفارش یافت نشد.', 'wc-bank-receipt' ) );
         }
+
+        $origin = $this->transition_origin( $transition, $args );
+
+        // A receipt decision sends its own, more specific SMS. Declaring that BEFORE the
+        // transition runs is what keeps the status change it causes from sending a second
+        // message to the same customer for the same action.
+        if ( in_array( $transition, array( 'approve', 'reject' ), true ) ) {
+            self::$sms_handled_orders[ (int) $order->get_id() ] = true;
+        }
+
+        return $this->with_origin( $origin, function () use ( $order, $transition, $args ) {
+            return $this->apply_transition_inner( $order, $transition, $args );
+        } );
+    }
+
+    /**
+     * The origin of a transition, from the action itself (not from the caller's opinion).
+     *
+     * A decision is always a manager's act; the upload is the customer's — unless a
+     * manager performed it through wp-admin, which the request itself betrays. Expiry is
+     * the scheduled job. An explicit `origin` argument wins, so an integration can be
+     * exact when it knows more.
+     */
+    private function transition_origin( $transition, $args ) {
+        if ( ! empty( $args['origin'] ) ) return (string) $args['origin'];
+
+        switch ( $transition ) {
+            case 'approve':
+            case 'reject':
+                return self::ORIGIN_ADMIN_REVIEW;
+            case 'expire':
+                return self::ORIGIN_SYSTEM;
+            case 'upload':
+                return $this->request_is_manager_driven() ? self::ORIGIN_ADMIN_MANUAL : self::ORIGIN_CUSTOMER_UPLOAD;
+        }
+        return self::ORIGIN_PLUGIN_INTERNAL;
+    }
+
+    /**
+     * The transition engine. Called only through apply_transition(), which owns the origin
+     * context — this method must never be called directly.
+     *
+     * @param WC_Order $order
+     * @param string   $transition
+     * @param array    $args
+     * @return array{ok:bool,code:string,message:string}
+     */
+    private function apply_transition_inner( $order, $transition, $args ) {
         $order_id = $order->get_id();
         if ( $order->get_payment_method() !== self::GATEWAY_ID ) {
             return $this->transition_result( false, 'not_bacs', __( 'این سفارش با کارت به کارت پرداخت نشده است.', 'wc-bank-receipt' ) );
@@ -2204,7 +2526,13 @@ class WC_Bank_Receipt_Pro {
                 $order->save();
 
                 if ( ! $this->move_order_to( $order, 'on-hold', __( 'فیش بانکی آپلود شد.', 'wc-bank-receipt' ) ) ) {
-                    return $this->transition_result( false, 'status_failed', __( 'فیش ذخیره شد اما تغییر وضعیت سفارش انجام نشد.', 'wc-bank-receipt' ) );
+                    // Two writes, no shared transaction: the file and its state are stored, the
+                    // status did not follow. The receipt is real and reviewable, so it stays —
+                    // dropping it would lose the customer's payment proof. The inconsistency is
+                    // recorded for the admin (the panel shows the review state, the order stays
+                    // pending), and the caller is told exactly what happened.
+                    $this->log_receipt_action( $order_id, 'upload_status_failed', sprintf( 'status=%s state=%s', $order->get_status(), $order->get_meta( self::META_STATE ) ) );
+                    return $this->transition_result( false, 'status_failed', __( 'فیش ذخیره شد اما تغییر وضعیت سفارش انجام نشد؛ فیش در صف بررسی است و وضعیت سفارش باید دستی بررسی شود.', 'wc-bank-receipt' ) );
                 }
                 $this->log_receipt_action( $order_id, 'uploaded' );
                 $this->send_admin_upload_sms( $order_id );
@@ -2230,6 +2558,14 @@ class WC_Bank_Receipt_Pro {
                     return $this->transition_result( false, 'status_failed', __( 'فیش تأیید شد اما تکمیل پرداخت سفارش ناموفق بود؛ لطفاً وضعیت سفارش را بررسی کنید.', 'wc-bank-receipt' ) );
                 }
                 $this->log_receipt_action( $order_id, 'approved', $charged ? 'card#' . $card . ' amount=' . $charged : '' );
+
+                // After the status change, so `{order_status}` / `{new_status}` in the template
+                // describe the order as it is now. (A message is only built when the event is
+                // enabled and the master switch is on, so this costs nothing otherwise.)
+                $this->send_receipt_decision_sms( $order_id, 'receipt_approved', array(
+                    'from' => 'on-hold',
+                    'to'   => self::normalize_status( $order->get_status() ),
+                ) );
                 return $this->transition_result( true, 'approved', __( 'فیش تأیید شد.', 'wc-bank-receipt' ) );
 
             case 'reject':
@@ -2246,6 +2582,12 @@ class WC_Bank_Receipt_Pro {
                     return $this->transition_result( false, 'status_failed', __( 'فیش رد شد اما تغییر وضعیت سفارش انجام نشد.', 'wc-bank-receipt' ) );
                 }
                 $this->log_receipt_action( $order_id, 'rejected', $reason );
+                // The reason travels in `{receipt_reject_reason}`, and the status is already
+                // back to `pending` — so the customer's message describes the final state.
+                $this->send_receipt_decision_sms( $order_id, 'receipt_rejected', array(
+                    'from' => 'on-hold',
+                    'to'   => self::normalize_status( $order->get_status() ),
+                ) );
                 return $this->transition_result( true, 'rejected', __( 'فیش رد شد؛ مشتری می‌تواند فیش جدید ارسال کند.', 'wc-bank-receipt' ) );
 
             case 'expire':
@@ -2510,14 +2852,33 @@ class WC_Bank_Receipt_Pro {
      * Print the "view stored receipt" affordance for the customer panel: a
      * nonce-scoped link for authorized viewers, an inline (data URI) preview for
      * everyone else — so guests never obtain a shareable URL to the file.
+     *
+     * The link is a lightbox trigger (`data-wcr-lb`); without JavaScript it is still an
+     * ordinary link and the receipt opens in a new tab.
      */
     private function receipt_view_affordance( $order, $label ) {
         $url = $this->receipt_view_url( $order );
         if ( '' !== $url ) {
-            echo '<a href="' . esc_url( $url ) . '" class="wcrf-prev-link" target="_blank" rel="noopener noreferrer">👁 ' . esc_html( $label ) . '</a>';
+            echo '<a href="' . esc_url( $url ) . '" class="wcrf-prev-link" target="_blank" rel="noopener noreferrer"'
+                . ' data-wcr-lb="' . esc_attr( $this->receipt_lightbox_type( $order ) ) . '"'
+                . ' data-wcr-lb-label="' . esc_attr( $label ) . '">👁 ' . esc_html( $label ) . '</a>';
             return;
         }
         $this->render_inline_receipt( $order, $label );
+    }
+
+    /**
+     * How must this receipt be shown: as a picture, or as a document?
+     *
+     * Decided from the file's *type*, not its name (the viewer must never try to draw a
+     * PDF with an <img>), and it defaults to the safe answer: anything unknown is treated
+     * as a document.
+     */
+    private function receipt_lightbox_type( $order ) {
+        $path = self::receipt_path( $order );
+        if ( '' === $path ) return 'document';
+        $mime = $this->detect_upload_mime( $path );
+        return ( 0 === strpos( (string) $mime, 'image/' ) ) ? 'image' : 'pdf';
     }
 
     /**
@@ -2542,9 +2903,14 @@ class WC_Bank_Receipt_Pro {
         $data = 'data:' . $mime . ';base64,' . base64_encode( $bytes );
 
         if ( 'application/pdf' === $mime ) {
+            // A guest may not receive a readable URL, so the document stays a download —
+            // it is deliberately never fed to the image viewer.
             echo '<a href="' . esc_attr( $data ) . '" download="' . esc_attr( basename( $path ) ) . '" class="wcrf-prev-link">📄 ' . esc_html( $label ) . '</a>';
         } else {
-            echo '<a href="' . esc_attr( $data ) . '" target="_blank" rel="noopener noreferrer" class="wcrf-prev-link">'
+            // The data URI is the only URL a guest ever gets; the viewer shows it full-size
+            // in the overlay while the thumbnail keeps the panel compact.
+            echo '<a href="' . esc_attr( $data ) . '" target="_blank" rel="noopener noreferrer" class="wcrf-prev-link"'
+                . ' data-wcr-lb="image" data-wcr-lb-label="' . esc_attr( $label ) . '">'
                 . '<img src="' . esc_attr( $data ) . '" alt="' . esc_attr( $label ) . '" class="wcrf-inline-receipt">'
                 . '</a>';
         }
@@ -2646,9 +3012,17 @@ class WC_Bank_Receipt_Pro {
             <?php endif; ?>
 
             <div class="wcr-order-actions" style="margin-top:14px;">
-                <button type="button" class="wcr-btn wcr-btn-ghost" onclick="document.getElementById('wor-lb-<?php echo $oid; ?>').classList.add('open')">
-                    👀 <?php _e( 'مشاهده فیش', 'wc-bank-receipt' ); ?>
-                </button>
+                <?php if ( $missing ) : ?>
+                    <span class="wcr-btn wcr-btn-ghost" style="cursor:not-allowed;opacity:.65;" title="<?php echo esc_attr__( 'فایل فیش روی سرور موجود نیست.', 'wc-bank-receipt' ); ?>">
+                        👀 <?php _e( 'مشاهده فیش', 'wc-bank-receipt' ); ?>
+                    </span>
+                <?php else : ?>
+                    <a class="wcr-btn wcr-btn-ghost" href="<?php echo esc_url( $url ); ?>" target="_blank" rel="noopener noreferrer"
+                       data-wcr-lb="<?php echo esc_attr( $this->receipt_lightbox_type( $order ) ); ?>"
+                       data-wcr-lb-label="<?php echo esc_attr( sprintf( __( 'فیش سفارش #%s', 'wc-bank-receipt' ), $order->get_order_number() ) ); ?>">
+                        👀 <?php _e( 'مشاهده فیش', 'wc-bank-receipt' ); ?>
+                    </a>
+                <?php endif; ?>
                 <button type="button" class="wcr-btn wcr-btn-ok r-btn" data-action="approve" data-id="<?php echo $oid; ?>" <?php echo $state==='approved'?'disabled':''; ?>>
                     ✓ <?php _e( 'تأیید', 'wc-bank-receipt' ); ?>
                 </button>
@@ -2663,24 +3037,18 @@ class WC_Bank_Receipt_Pro {
             </div>
         </div>
 
-        <!-- Lightbox -->
-        <div class="wcr-lightbox" id="wor-lb-<?php echo $oid; ?>" onclick="this.classList.remove('open')">
-            <button class="wcr-lb-close" onclick="document.getElementById('wor-lb-<?php echo $oid; ?>').classList.remove('open')">✕</button>
-            <?php if ( $missing ) : ?>
-                <div style="background:#fff;padding:30px;border-radius:10px;text-align:center;">
-                    <div style="font-size:60px;">📄</div>
-                    <p><?php esc_html_e( 'فایل فیش موجود نیست.', 'wc-bank-receipt' ); ?></p>
-                </div>
-            <?php elseif ( $is_img ) : ?>
-                <img src="<?php echo esc_url( $url ); ?>" onclick="event.stopPropagation()">
-            <?php else : ?>
-                <div style="background:#fff;padding:30px;border-radius:10px;text-align:center;">
-                    <div style="font-size:60px;">📄</div>
-                    <p><?php esc_html_e( 'فایل PDF است.', 'wc-bank-receipt' ); ?></p>
-                    <a href="<?php echo esc_url( $url ); ?>" target="_blank" class="wcr-btn wcr-btn-primary"><?php esc_html_e( 'دانلود / مشاهده', 'wc-bank-receipt' ); ?></a>
-                </div>
-            <?php endif; ?>
-        </div>
+        <?php
+        /*
+         * No per-order overlay markup any more.
+         *
+         * The old block was one hidden <div> per order with its own id, its own inline
+         * onclick and no keyboard support. The shared viewer (assets/js/lightbox.js)
+         * builds a single overlay for the page instead, so the order screen, the gallery
+         * and the customer panel all get identical behaviour — object-fit: contain,
+         * Escape, backdrop-to-close, scroll restore — with no duplicated ids.
+         */
+        $this->enqueue_lightbox_assets();
+        ?>
 
         <script>
         jQuery(function($){
@@ -3172,11 +3540,13 @@ class WC_Bank_Receipt_Pro {
                     <div class="wcr-gitem">
                         <div class="wcr-gthumb">
                             <?php if ( $exists && $is_img ) : ?>
-                                <a href="<?php echo esc_url($view_url); ?>" target="_blank">
+                                <a href="<?php echo esc_url($view_url); ?>" target="_blank" rel="noopener noreferrer"
+                                   data-wcr-lb="image" data-wcr-lb-label="<?php echo esc_attr( sprintf( __( 'فیش سفارش #%s', 'wc-bank-receipt' ), $order->get_order_number() ) ); ?>">
                                     <img src="<?php echo esc_url($view_url); ?>" alt="فیش #<?php echo $oid; ?>">
                                 </a>
                             <?php elseif ( $exists ) : ?>
-                                <a href="<?php echo esc_url($view_url); ?>" target="_blank" class="pdf-icon">📄</a>
+                                <a href="<?php echo esc_url($view_url); ?>" target="_blank" rel="noopener noreferrer" class="pdf-icon"
+                                   data-wcr-lb="pdf" data-wcr-lb-label="<?php echo esc_attr( sprintf( __( 'فیش سفارش #%s', 'wc-bank-receipt' ), $order->get_order_number() ) ); ?>">📄</a>
                             <?php else : ?>
                                 <span style="color:#b0bec5;font-size:32px;">🗑</span>
                             <?php endif; ?>
@@ -3197,7 +3567,9 @@ class WC_Bank_Receipt_Pro {
                             </div>
                             <div class="actions">
                                 <?php if ( $exists ) : ?>
-                                <a href="<?php echo esc_url($view_url); ?>" target="_blank" class="wcr-btn wcr-btn-ghost wcr-btn-sm">👁</a>
+                                <a href="<?php echo esc_url($view_url); ?>" target="_blank" rel="noopener noreferrer" class="wcr-btn wcr-btn-ghost wcr-btn-sm"
+                                   data-wcr-lb="<?php echo $is_img ? 'image' : 'pdf'; ?>"
+                                   data-wcr-lb-label="<?php echo esc_attr( sprintf( __( 'فیش سفارش #%s', 'wc-bank-receipt' ), $order->get_order_number() ) ); ?>">👁</a>
                                 <?php endif; ?>
                                 <a href="<?php echo esc_url($del_url); ?>" class="wcr-btn wcr-btn-err wcr-btn-sm"
                                    onclick="return confirm('<?php esc_attr_e('آیا مطمئنید؟','wc-bank-receipt'); ?>');">🗑</a>
@@ -3336,75 +3708,587 @@ class WC_Bank_Receipt_Pro {
     }
 
     // =========================================================================
-    // SMS
+    // SMS — TEMPLATES, VARIABLES, DELIVERY PIPELINE, RETRY & LOG
+    //
+    // The feature is real and usable now, and it is OFF until the shop owner turns it on:
+    //   * the master switch (`wc_sms_enabled`) ships as “no”;
+    //   * every event has its own switch and its own template;
+    //   * a message is only ever sent when the master switch, the event switch, the
+    //     provider and its credentials are all in place.
+    // So installing or updating the plugin can never start sending messages the owner did
+    // not ask for — and no message is ever sent to a hand-typed number except through the
+    // explicit “test send” action on the settings screen.
+    //
+    // Everything below is one path: build → claim (dedupe) → store → send → record → retry.
     // =========================================================================
 
-    /** Default templates, also used as the fallback when an option is empty. */
-    private function sms_templates() {
+    /** Is the SMS feature switched on at all? Off by default, filterable by a site. */
+    public static function sms_master_enabled() {
+        return (bool) apply_filters( 'wc_receipt_sms_enabled', 'yes' === get_option( 'wc_sms_enabled', 'no' ) );
+    }
+
+    /**
+     * The event registry: what can be sent, to whom, and under which option names.
+     *
+     * `opt_template` / `opt_enabled` deliberately keep the option names this plugin has
+     * always used (`wc_sms_approved_tpl`, `wc_sms_admin_upload_tpl`, …): an installation
+     * that configured SMS before the feature was parked keeps every template, sender and
+     * credential it had.
+     */
+    private function sms_events() {
         return array(
-            'approved'     => __( 'مشتری گرامی، فیش سفارش {order_id} تأیید شد.', 'wc-bank-receipt' ),
-            'rejected'     => __( 'مشتری گرامی، فیش سفارش {order_id} رد شد. لطفاً مجدد ارسال کنید.', 'wc-bank-receipt' ),
-            'reminder'     => __( 'مشتری گرامی، مهلت پرداخت سفارش {order_id} رو به اتمام است.', 'wc-bank-receipt' ),
-            'cancelled'    => __( 'سفارش {order_id} به دلیل عدم پرداخت لغو شد.', 'wc-bank-receipt' ),
-            'admin_upload' => __( 'فیش جدید برای سفارش {order_id} بارگذاری شد.', 'wc-bank-receipt' ),
+            'new_order' => array(
+                'label'           => __( 'ثبت سفارش جدید (پیامک به مشتری)', 'wc-bank-receipt' ),
+                'audience'        => 'customer',
+                'opt_template'    => 'wc_sms_new_order_tpl',
+                'opt_enabled'     => 'wc_sms_new_order_enabled',
+                'default_enabled' => 'no',
+                'default'         => __( 'مشتری گرامی، سفارش {order_number} با مبلغ {order_total} {currency} ثبت شد.', 'wc-bank-receipt' ),
+            ),
+            'receipt_uploaded' => array(
+                'label'           => __( 'ارسال فیش توسط مشتری (اطلاع به مدیر)', 'wc-bank-receipt' ),
+                'audience'        => 'admin',
+                'opt_template'    => 'wc_sms_admin_upload_tpl',
+                'opt_enabled'     => 'wc_sms_admin_upload_enabled',
+                'default_enabled' => 'yes',
+                'default'         => __( 'فیش جدید برای سفارش {order_number} بارگذاری شد.', 'wc-bank-receipt' ),
+            ),
+            'receipt_approved' => array(
+                'label'           => __( 'تأیید فیش (پیامک به مشتری)', 'wc-bank-receipt' ),
+                'audience'        => 'customer',
+                'opt_template'    => 'wc_sms_approved_tpl',
+                'opt_enabled'     => 'wc_sms_approved_enabled',
+                'default_enabled' => 'yes',
+                'default'         => __( 'مشتری گرامی، فیش سفارش {order_number} تأیید شد.', 'wc-bank-receipt' ),
+            ),
+            'receipt_rejected' => array(
+                'label'           => __( 'رد فیش (پیامک به مشتری)', 'wc-bank-receipt' ),
+                'audience'        => 'customer',
+                'opt_template'    => 'wc_sms_rejected_tpl',
+                'opt_enabled'     => 'wc_sms_rejected_enabled',
+                'default_enabled' => 'yes',
+                'default'         => __( 'مشتری گرامی، فیش سفارش {order_number} رد شد. دلیل: {receipt_reject_reason} — لطفاً فیش جدید ارسال کنید.', 'wc-bank-receipt' ),
+            ),
+            'reminder' => array(
+                'label'           => __( 'یادآوری مهلت پرداخت (پیامک به مشتری)', 'wc-bank-receipt' ),
+                'audience'        => 'customer',
+                'opt_template'    => 'wc_sms_reminder_tpl',
+                'opt_enabled'     => 'wc_sms_reminder_enabled',
+                'default_enabled' => 'yes',
+                'default'         => __( 'مشتری گرامی، مهلت پرداخت سفارش {order_number} رو به اتمام است.', 'wc-bank-receipt' ),
+            ),
+            'status_change' => array(
+                'label'           => __( 'تغییر وضعیت سفارش (به تفکیک هر وضعیت)', 'wc-bank-receipt' ),
+                'audience'        => 'customer',
+                'opt_template'    => 'wc_sms_status_tpl',
+                'opt_enabled'     => 'wc_sms_status_enabled',
+                'default_enabled' => 'no',
+                'default'         => __( 'مشتری گرامی، وضعیت سفارش {order_number} از {old_status} به {new_status} تغییر کرد.', 'wc-bank-receipt' ),
+            ),
+        );
+    }
+
+    /** Option names of one status’s own template and switch. */
+    private function sms_status_option( $status, $suffix ) {
+        return 'wc_sms_status_' . sanitize_key( $status ) . '_' . $suffix;
+    }
+
+    /**
+     * Every order status a manager can enable an SMS for.
+     *
+     * Read from WooCommerce itself, so a site with custom statuses gets them too — this
+     * plugin never invents a status and never assumes a fixed list.
+     */
+    private function sms_status_choices() {
+        $out = array();
+        if ( function_exists( 'wc_get_order_statuses' ) ) {
+            foreach ( wc_get_order_statuses() as $key => $label ) {
+                $slug = self::normalize_status( $key );
+                if ( '' === $slug ) continue;
+                $out[ $slug ] = $label;
+            }
+        }
+        if ( ! $out ) {
+            $out = array(
+                'pending'    => 'در انتظار پرداخت',
+                'on-hold'    => 'در انتظار بررسی',
+                'processing' => 'در حال انجام',
+                'completed'  => 'تکمیل‌شده',
+                'cancelled'  => 'لغو شده',
+                'failed'     => 'ناموفق',
+            );
+        }
+        return $out;
+    }
+
+    /**
+     * THE resolved template for one event — the single place templates are read from, so
+     * the settings screen, the preview and the outgoing message can never disagree.
+     */
+    private function sms_template_for( $event, $status = '' ) {
+        if ( 'status_change' === $event && '' !== $status ) {
+            $events = $this->sms_events();
+            $fallback = (string) get_option( 'wc_sms_status_tpl', '' );
+            if ( '' === $fallback ) $fallback = $events['status_change']['default'];
+            $stored = (string) get_option( $this->sms_status_option( $status, 'tpl' ), '' );
+            return ( '' !== $stored ) ? $stored : $fallback;
+        }
+        $events = $this->sms_events();
+        if ( ! isset( $events[ $event ] ) ) return '';
+        $stored = (string) get_option( $events[ $event ]['opt_template'], '' );
+        return ( '' !== $stored ) ? $stored : (string) $events[ $event ]['default'];
+    }
+
+    /** Is this event switched on? The master switch is checked separately. */
+    private function sms_event_enabled( $event, $status = '' ) {
+        if ( 'status_change' === $event ) {
+            if ( '' === $status ) return false;
+            // A status SMS is opt-in per status: unknown/untouched statuses stay silent.
+            return 'yes' === get_option( $this->sms_status_option( $status, 'enabled' ), 'no' );
+        }
+        $events = $this->sms_events();
+        if ( ! isset( $events[ $event ] ) ) return false;
+        return 'yes' === get_option( $events[ $event ]['opt_enabled'], $events[ $event ]['default_enabled'] );
+    }
+
+    /**
+     * The whole variable contract, documented in one place.
+     *
+     * Every value comes from a WooCommerce API or from this plugin's own order meta — never
+     * from the request. `{order_url}` is only produced for an order that belongs to a
+     * registered customer, because the only safe view URL WooCommerce offers requires a
+     * signed-in session; a guest message must not carry the order key.
+     *
+     * @param WC_Order $order
+     * @param array    $ctx from | to | receipt_status | extra
+     * @return array<string,string>
+     */
+    private function sms_variable_map( $order, $ctx = array() ) {
+        $from = isset( $ctx['from'] ) ? self::normalize_status( $ctx['from'] ) : '';
+        $to   = isset( $ctx['to'] ) ? self::normalize_status( $ctx['to'] ) : self::normalize_status( $order->get_status() );
+
+        $receipt_state = (string) $order->get_meta( self::META_STATE );
+        $receipt_labels = array(
+            ''              => __( 'بدون فیش', 'wc-bank-receipt' ),
+            'pending_review' => __( 'در انتظار بررسی', 'wc-bank-receipt' ),
+            'approved'      => __( 'تأییدشده', 'wc-bank-receipt' ),
+            'rejected'      => __( 'ردشده', 'wc-bank-receipt' ),
+        );
+
+        $map = array(
+            'order_id'               => (string) $order->get_id(),
+            'order_number'           => (string) $order->get_order_number(),
+            'old_status'             => '' !== $from ? $this->status_label( $from ) : '',
+            'new_status'             => '' !== $to ? $this->status_label( $to ) : '',
+            'order_status'           => $this->status_label( $order->get_status() ),
+            'customer_name'          => $this->order_customer_name( $order ),
+            'billing_first_name'     => (string) $order->get_billing_first_name(),
+            'billing_last_name'      => (string) $order->get_billing_last_name(),
+            'billing_phone'          => (string) $order->get_billing_phone(),
+            // The amount only — no currency symbol: the templates compose the two, either as
+            // `{order_total} {currency}` or with a word between them. Embedding the symbol here
+            // would print it twice in the shipped defaults.
+            'order_total'            => number_format_i18n( (float) $order->get_total(), wc_get_price_decimals() ),
+            'currency'               => function_exists( 'get_woocommerce_currency' ) ? (string) get_woocommerce_currency() : '',
+            'payment_method'         => (string) $order->get_payment_method_title(),
+            'site_name'              => wp_specialchars_decode( (string) get_bloginfo( 'name' ), ENT_QUOTES ),
+            'order_date'             => $order->get_date_created() ? wc_format_datetime( $order->get_date_created() ) : '',
+            'receipt_status'         => isset( $receipt_labels[ $receipt_state ] ) ? $receipt_labels[ $receipt_state ] : $receipt_state,
+            'receipt_reject_reason'  => (string) $order->get_meta( self::META_REJECT_REASON ),
+        );
+
+        // A view URL is only minted for an order that belongs to a signed-in customer: the
+        // guest path would have to carry the order key, and an SMS travels in clear text.
+        $map['order_url'] = ( (int) $order->get_customer_id() > 0 && method_exists( $order, 'get_view_order_url' ) )
+            ? (string) $order->get_view_order_url()
+            : '';
+
+        return (array) apply_filters( 'wc_receipt_sms_variables', $map, $order, $ctx );
+    }
+
+    /**
+     * Substitute {placeholders} from an allowlist.
+     *
+     * No eval, no callbacks from settings, no request input: the template is treated as
+     * text and a placeholder that is not in the map is left exactly as the manager typed it
+     * (a visible, honest signal) instead of being replaced by something invented.
+     */
+    private function sms_render_map( $template, $map ) {
+        $template = (string) $template;
+        return (string) preg_replace_callback(
+            '/\{([a-z0-9_]+)\}/i',
+            function ( $m ) use ( $map ) {
+                $key = strtolower( $m[1] );
+                return array_key_exists( $key, $map ) ? (string) $map[ $key ] : $m[0];
+            },
+            $template
+        );
+    }
+
+    /** Placeholders a template uses that the resolver does not know. */
+    private function sms_unknown_variables( $template, $map = null ) {
+        if ( null === $map ) $map = $this->sms_sample_map();
+        $unknown = array();
+        if ( preg_match_all( '/\{([a-z0-9_]+)\}/i', (string) $template, $m ) ) {
+            foreach ( $m[1] as $key ) {
+                if ( ! array_key_exists( strtolower( $key ), $map ) ) $unknown[] = '{' . $key . '}';
+            }
+        }
+        return array_values( array_unique( $unknown ) );
+    }
+
+    /**
+     * A sample variable map for the previews — no real order, no real customer.
+     *
+     * The numbers and the name are fixed on purpose: a preview that showed a real
+     * customer's phone number would turn the settings screen into a data leak, and a
+     * *varying* sample would make “does my template read well?” impossible to judge.
+     */
+    private function sms_sample_map() {
+        $statuses = $this->sms_status_choices();
+        $pending  = isset( $statuses['pending'] ) ? $statuses['pending'] : 'pending';
+        $onhold   = isset( $statuses['on-hold'] ) ? $statuses['on-hold'] : 'on-hold';
+        return array(
+            'order_id'              => '1234',
+            'order_number'          => '1234',
+            'old_status'            => $pending,
+            'new_status'            => $onhold,
+            'order_status'          => $onhold,
+            'customer_name'         => __( 'نام نمونه', 'wc-bank-receipt' ),
+            'billing_first_name'    => __( 'نام', 'wc-bank-receipt' ),
+            'billing_last_name'     => __( 'نمونه', 'wc-bank-receipt' ),
+            'billing_phone'         => '09120000000',
+            'order_total'           => '1,000,000',
+            'currency'              => function_exists( 'get_woocommerce_currency' ) ? (string) get_woocommerce_currency() : 'IRR',
+            'payment_method'        => __( 'کارت به کارت', 'wc-bank-receipt' ),
+            'site_name'             => wp_specialchars_decode( (string) get_bloginfo( 'name' ), ENT_QUOTES ),
+            'order_date'            => function_exists( 'wc_format_datetime' ) && function_exists( 'current_datetime' )
+                                        ? wc_format_datetime( current_datetime() ) : '',
+            'receipt_status'        => __( 'در انتظار بررسی', 'wc-bank-receipt' ),
+            'receipt_reject_reason' => __( 'مبلغ واریزی با مبلغ سفارش مطابقت ندارد', 'wc-bank-receipt' ),
+            'order_url'             => '',
         );
     }
 
     /**
-     * Status-driven SMS with a per-transition dedupe gate: one message per order
-     * per transition, even if an admin toggles the status back and forth.
+     * Length and billing information for the settings screen.
+     *
+     * Persian is UCS-2 as far as SMS is concerned: 70 characters per segment and 67 per
+     * concatenated part. The counts are shown so the manager can see what a template will
+     * cost *before* saving it — the plugin never truncates a message behind their back.
      */
-    public function send_sms_on_status_change( $order_id, $old_status, $new_status, $order ) {
-        if ( ! self::SMS_UI_ENABLED ) return;   // SMS off in this release
-        if ( ! $order instanceof WC_Order ) {
-            $order = wc_get_order( $order_id );
-        }
-        if ( ! $order || ! $this->woocommerce_is_available() ) return;
-
-        $phone = $order->get_billing_phone();
-        if ( empty( $phone ) ) return;
-
-        $state = (string) $order->get_meta( self::META_STATE );
-        $event = '';
-        if ( 'processing' === $new_status && 'approved' === $state ) {
-            $event = 'approved';
-        } elseif ( 'completed' === $new_status && 'approved' === $state ) {
-            $event = 'approved';
-        } elseif ( 'pending' === $new_status && 'rejected' === $state ) {
-            $event = 'rejected';
-        } elseif ( 'failed' === $new_status && 'approved' !== $state ) {
-            $event = 'cancelled';
-        }
-        if ( '' === $event ) return;
-
-        // Dedupe: claim a row keyed by this transition and receipt instance.
-        if ( ! $this->claim_transition( $order_id, $this->receipt_uid( $order ), 'sms_' . $event ) ) {
-            return;
-        }
-
-        $templates = $this->sms_templates();
-        $tpl  = get_option( "wc_sms_{$event}_tpl", $templates[ $event ] );
-        if ( empty( $tpl ) ) $tpl = $templates[ $event ];
-        $this->send_sms( $phone, str_replace( '{order_id}', $order_id, $tpl ), $event, $order_id );
+    private function sms_length_info( $message ) {
+        $text  = (string) $message;
+        $chars = function_exists( 'mb_strlen' ) ? mb_strlen( $text, 'UTF-8' ) : strlen( $text );
+        $gsm   = (bool) preg_match( '/^[A-Za-z0-9 @£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ!"#¤%&\'()*+,\-.\/:;<=>?¡ÄÖÑÜ§¿äöñüà\r\n]*$/', $text );
+        $single = $gsm ? 160 : 70;
+        $multi  = $gsm ? 153 : 67;
+        $parts  = ( $chars <= $single ) ? 1 : (int) ceil( $chars / $multi );
+        return array( 'chars' => $chars, 'parts' => max( 1, $parts ), 'encoding' => $gsm ? 'GSM-7' : 'UCS-2' );
     }
 
-    private function send_admin_upload_sms( $order_id ) {
-        $admin_phone = get_option( 'wc_sms_admin_phone' );
-        if ( empty( $admin_phone ) ) return;
-        $templates = $this->sms_templates();
-        $tpl = get_option( 'wc_sms_admin_upload_tpl', $templates['admin_upload'] );
-        $this->send_sms( $admin_phone, str_replace( '{order_id}', $order_id, $tpl ), 'admin_upload', $order_id );
+    // ------------------------------------------------------------------
+    // DELIVERY
+    // ------------------------------------------------------------------
+
+    /**
+     * Send one event's message.
+     *
+     * @param string $event   new_order | receipt_uploaded | receipt_approved | receipt_rejected | reminder | status_change
+     * @param int    $order_id
+     * @param array  $ctx     from | to | status (target status) | recipient | force | source
+     * @return array{status:string,row:int}
+     */
+    private function sms_send_event( $event, $order_id, $ctx = array() ) {
+        if ( ! self::sms_master_enabled() ) return array( 'status' => 'off', 'row' => 0 );
+
+        $order = wc_get_order( (int) $order_id );
+        if ( ! $order instanceof WC_Order ) return array( 'status' => 'no_order', 'row' => 0 );
+
+        $status = isset( $ctx['status'] ) ? self::normalize_status( $ctx['status'] ) : '';
+        if ( ! $this->sms_event_enabled( $event, $status ) ) return array( 'status' => 'disabled', 'row' => 0 );
+
+        $template = $this->sms_template_for( $event, $status );
+        if ( '' === trim( (string) $template ) ) return array( 'status' => 'no_template', 'row' => 0 );
+
+        // Recipient: the customer's billing phone, or the shop's own number for the events
+        // addressed to the manager. An explicit recipient is only honoured for the manual
+        // test path (see sms_send_test), never for an automatic event.
+        $audience = 'admin';
+        $events   = $this->sms_events();
+        if ( isset( $events[ $event ] ) ) $audience = $events[ $event ]['audience'];
+        $phone = isset( $ctx['recipient'] ) && '' !== $ctx['recipient']
+            ? (string) $ctx['recipient']
+            : ( 'admin' === $audience ? (string) get_option( 'wc_sms_admin_phone', '' ) : (string) $order->get_billing_phone() );
+        if ( '' === trim( $phone ) ) return array( 'status' => 'no_recipient', 'row' => 0 );
+
+        $message = $this->sms_render_map( $template, $this->sms_variable_map( $order, $ctx ) );
+
+        /*
+         * Dedupe claim. One message per (order, event, receipt instance) — the same atomic
+         * ledger the approve/reject decisions use, so a repeated hook, a double click or two
+         * concurrent requests cannot produce two messages. A later receipt instance has a
+         * different uid and is therefore allowed to notify again.
+         */
+        $uid = $this->receipt_uid( $order );
+        if ( '' === $uid ) $uid = 'order';
+        $claim = 'sms:' . substr( $event, 0, 10 ) . ( '' !== $status ? ':' . substr( $status, 0, 6 ) : '' );
+        if ( empty( $ctx['force'] ) && ! $this->claim_transition( (int) $order_id, $uid, $claim ) ) {
+            return array( 'status' => 'duplicate', 'row' => 0 );
+        }
+
+        return $this->sms_deliver( $event, $order, $phone, $message, $ctx );
     }
 
     /**
-     * One reminder per receipt cycle, based on the same absolute deadline as the
-     * customer countdown (never a separate, drifting schedule). Processes pending
-     * orders in bounded batches.
+     * Store the message, hand it to the provider and record what actually happened.
+     *
+     * The row exists BEFORE the network call (status `queued`), so a fatal error, a timeout
+     * or a killed worker leaves evidence instead of a message that vanished — and the retry
+     * job can pick it up.
+     */
+    private function sms_deliver( $event, $order, $phone, $message, $ctx = array() ) {
+        global $wpdb;
+        $table = $wpdb->prefix . self::DB_PREFIX . 'sms_log';
+
+        $provider = (string) get_option( 'wc_sms_provider', 'kavenegar' );
+        $now      = current_time( 'mysql' );
+
+        $wpdb->insert( $table, array(
+            'order_id'   => $order ? (int) $order->get_id() : 0,
+            'recipient'  => $phone,
+            'message'    => $message,
+            'status'     => 'queued',
+            'response'   => '',
+            'event'      => substr( (string) $event, 0, 40 ),
+            'provider'   => substr( $provider, 0, 20 ),
+            'attempts'   => 0,
+            'event_key'  => substr( md5( $event . '|' . ( $order ? $order->get_id() : 0 ) . '|' . $now . '|' . mt_rand() ), 0, 40 ),
+            'created_at' => $now,
+            'updated_at' => $now,
+        ) );
+        $row_id = (int) $wpdb->insert_id;
+        if ( ! $row_id ) {
+            // The table is the record of truth; without it the message is not sent, so the
+            // shop can never pay for a message nobody can see.
+            return array( 'status' => 'log_failed', 'row' => 0 );
+        }
+
+        return $this->sms_attempt( $row_id, $phone, $message, $provider, $event );
+    }
+
+    /**
+     * One delivery attempt for a stored row (first try and every retry alike).
+     *
+     * Retry policy lives here: a transient failure is retried a bounded number of times
+     * with a growing delay, a permanent one (bad number, rejected credentials, a 4xx the
+     * provider will repeat forever) is final. The decision comes from the transport and the
+     * provider payload — never from “no WP_Error”.
+     */
+    private function sms_attempt( $row_id, $phone, $message, $provider, $event = '' ) {
+        global $wpdb;
+        $table = $wpdb->prefix . self::DB_PREFIX . 'sms_log';
+
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", (int) $row_id ) );
+        if ( ! $row ) return array( 'status' => 'no_row', 'row' => 0 );
+
+        $attempts = (int) $row->attempts;
+        $wpdb->update( $table, array( 'status' => 'sending', 'attempts' => $attempts + 1, 'updated_at' => current_time( 'mysql' ) ), array( 'id' => (int) $row_id ) );
+
+        $result = $this->send_sms_raw( $phone, $message, $provider, $this->sms_sender_for( $event ) );
+
+        $status  = (string) $result['status'];
+        $retry   = ! empty( $result['retryable'] ) && ( $attempts + 1 ) < self::SMS_MAX_ATTEMPTS;
+        $delay   = min( 3600, (int) pow( 2, $attempts + 1 ) * 60 );   // 2min, 4min, 8min …
+
+        $update = array(
+            'status'       => $status,
+            'response'     => substr( $this->sms_redact( (string) $result['response'] ), 0, 500 ),
+            'provider'     => substr( (string) $provider, 0, 20 ),
+            'attempts'     => $attempts + 1,
+            'http_code'    => (int) $result['http'],
+            'provider_id'  => substr( (string) $result['provider_id'], 0, 100 ),
+            'updated_at'   => current_time( 'mysql' ),
+            'next_attempt' => $retry ? gmdate( 'Y-m-d H:i:s', time() + $delay ) : null,
+            'sent_at'      => in_array( $status, array( 'sent' ), true ) ? current_time( 'mysql' ) : null,
+        );
+        $wpdb->update( $table, $update, array( 'id' => (int) $row_id ) );
+
+        if ( $retry ) $this->sms_schedule_retry( (int) $row_id, $delay );
+
+        return array( 'status' => $status, 'row' => (int) $row_id, 'retry' => $retry );
+    }
+
+    /** The per-event sender line, falling back to the provider's own default. */
+    private function sms_sender_for( $event ) {
+        $provider = (string) get_option( 'wc_sms_provider', 'kavenegar' );
+        $key      = (string) $event;
+        if ( 'receipt_uploaded' === $key ) $key = 'admin_upload';
+        if ( '' !== $key ) {
+            $sender = get_option( 'wc_sms_' . $key . '_sender' );
+            if ( ! empty( $sender ) ) return (string) $sender;
+        }
+        return (string) get_option( 'wc_sms_' . $provider . '_sender', '' );
+    }
+
+    /**
+     * Remove anything that looks like a stored credential from a provider answer.
+     *
+     * A provider may echo the request (some do, in an error body). The log is readable by
+     * every shop manager, so the secrets are stripped before the text is stored.
+     */
+    private function sms_redact( $text ) {
+        $text = (string) $text;
+        $secrets = array(
+            get_option( 'wc_sms_kavenegar_apikey' ),
+            get_option( 'wc_sms_melli_password' ),
+            get_option( 'wc_sms_custom_apikey' ),
+        );
+        foreach ( $secrets as $secret ) {
+            $secret = (string) $secret;
+            if ( strlen( $secret ) >= 4 ) {
+                $text = str_replace( $secret, '***', $text );
+            }
+        }
+        return $text;
+    }
+
+    /** Queue a retry as a single, deduplicated cron event. */
+    private function sms_schedule_retry( $row_id, $delay = 120 ) {
+        $hook = 'wc_receipt_sms_retry_hook';
+        if ( wp_next_scheduled( $hook, array( (int) $row_id ) ) ) return;
+        wp_schedule_single_event( time() + max( 60, (int) $delay ), $hook, array( (int) $row_id ) );
+    }
+
+    /**
+     * The retry worker. It re-reads the row, so a message that already succeeded (a racing
+     * first attempt) is never sent twice.
+     */
+    public function sms_retry_due( $row_id ) {
+        if ( ! self::sms_master_enabled() ) return;
+
+        global $wpdb;
+        $table = $wpdb->prefix . self::DB_PREFIX . 'sms_log';
+        $row   = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", (int) $row_id ) );
+        if ( ! $row ) return;
+        if ( 'sent' === (string) $row->status ) return;
+        if ( (int) $row->attempts >= self::SMS_MAX_ATTEMPTS ) return;
+
+        $this->sms_attempt( (int) $row->id, (string) $row->recipient, (string) $row->message, (string) $row->provider, (string) $row->event );
+    }
+
+    /**
+     * The admin's explicit test send. The only path where a recipient is taken from the
+     * request, and it is a manager who typed it and pressed the button — never an automatic
+     * event, which always uses the order's own phone.
+     */
+    public function sms_send_test( $event, $phone, $template = '', $status = '' ) {
+        if ( ! self::sms_master_enabled() ) {
+            return array( 'status' => 'off', 'message' => __( 'پیامک در تنظیمات خاموش است.', 'wc-bank-receipt' ) );
+        }
+        $phone = preg_replace( '/[^0-9+]/', '', (string) $phone );
+        if ( '' === $phone ) {
+            return array( 'status' => 'no_recipient', 'message' => __( 'شمارهٔ گیرنده را وارد کنید.', 'wc-bank-receipt' ) );
+        }
+
+        $text = '' !== trim( (string) $template ) ? (string) $template : $this->sms_template_for( $event, $status );
+        $message = $this->sms_render_map( $text, $this->sms_sample_map() );
+
+        $provider = (string) get_option( 'wc_sms_provider', 'kavenegar' );
+        $result = $this->send_sms_raw( $phone, $message, $provider, $this->sms_sender_for( $event ) );
+
+        global $wpdb;
+        $wpdb->insert( $wpdb->prefix . self::DB_PREFIX . 'sms_log', array(
+            'order_id'   => 0,
+            'recipient'  => $phone,
+            'message'    => $message,
+            'status'     => (string) $result['status'],
+            'response'   => substr( $this->sms_redact( (string) $result['response'] ), 0, 500 ),
+            'event'      => 'test',
+            'provider'   => substr( $provider, 0, 20 ),
+            'attempts'   => 1,
+            'http_code'  => (int) $result['http'],
+            'provider_id' => substr( (string) $result['provider_id'], 0, 100 ),
+            'created_at' => current_time( 'mysql' ),
+            'updated_at' => current_time( 'mysql' ),
+        ) );
+
+        $labels = array(
+            'sent'    => __( 'پیام آزمایشی ارسال شد.', 'wc-bank-receipt' ),
+            'failed'  => __( 'ارسال آزمایشی ناموفق بود؛ پاسخ ارائه‌دهنده در تاریخچه ثبت شد.', 'wc-bank-receipt' ),
+            'unknown' => __( 'پاسخ ارائه‌دهنده قابل تشخیص نبود؛ تاریخچه را بررسی کنید.', 'wc-bank-receipt' ),
+        );
+        return array(
+            'status'  => (string) $result['status'],
+            'message' => isset( $labels[ $result['status'] ] ) ? $labels[ $result['status'] ] : (string) $result['response'],
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EVENT WIRING
+    // ------------------------------------------------------------------
+
+    /**
+     * `woocommerce_order_status_changed` → the per-status template.
+     *
+     * Depends on nothing the alert popup does: silencing the dashboard popup for a manager's
+     * own action must never silence the customer's message, so this path is decided here,
+     * from the SMS settings alone.
+     */
+    public function send_sms_on_status_change( $order_id, $old_status, $new_status, $order ) {
+        if ( ! self::sms_master_enabled() ) return;
+        if ( ! $order instanceof WC_Order ) {
+            $order = wc_get_order( $order_id );
+        }
+        if ( ! $order instanceof WC_Order ) return;
+
+        // A receipt decision already sent its own, more specific message for this operation
+        // (approved/rejected). Sending the generic status message too would be exactly the
+        // duplicate the mission forbids.
+        if ( isset( self::$sms_handled_orders[ (int) $order_id ] ) ) return;
+
+        $status = self::normalize_status( $new_status );
+        if ( '' === $status ) return;
+        if ( ! $this->sms_event_enabled( 'status_change', $status ) ) return;
+
+        $this->sms_send_event( 'status_change', (int) $order_id, array(
+            'status' => $status,
+            'from'   => self::normalize_status( $old_status ),
+            'to'     => $status,
+        ) );
+    }
+
+    /** New order → the optional “we received your order” message. */
+    public function send_sms_on_new_order( $order_id, $order = null ) {
+        if ( ! self::sms_master_enabled() ) return;
+        if ( ! $order instanceof WC_Order ) {
+            $order = wc_get_order( $order_id );
+        }
+        if ( ! $order instanceof WC_Order ) return;
+        $this->sms_send_event( 'new_order', (int) $order->get_id(), array( 'to' => self::normalize_status( $order->get_status() ) ) );
+    }
+
+    /** A customer uploaded a receipt → tell the shop (the old `admin_upload` template). */
+    public function send_admin_upload_sms( $order_id ) {
+        $this->sms_send_event( 'receipt_uploaded', (int) $order_id, array( 'receipt_status' => 'pending_review' ) );
+    }
+
+    /** A decision was made → the customer's own template for it. */
+    private function send_receipt_decision_sms( $order_id, $event, $extra = array() ) {
+        // Marked first: every status change this decision causes (payment_complete, reject →
+        // pending, expire → failed) must not also fire the generic status message.
+        self::$sms_handled_orders[ (int) $order_id ] = true;
+        $this->sms_send_event( $event, (int) $order_id, $extra );
+    }
+
+    /**
+     * One reminder per receipt cycle, based on the same absolute deadline as the customer
+     * countdown (never a separate, drifting schedule). Processes pending orders in bounded
+     * batches, and only for orders whose reminder template is enabled.
      */
     public function send_payment_reminders() {
-        // The reminder is an SMS-only feature: with SMS off the cron job does nothing and
-        // no order is ever flagged as “reminded”.
-        if ( ! self::SMS_UI_ENABLED ) return;
+        if ( ! self::sms_master_enabled() ) return;
+        if ( ! $this->sms_event_enabled( 'reminder' ) ) return;
         if ( ! $this->woocommerce_is_available() ) return;
         $reminder_hours = absint( get_option( 'wc_sms_reminder_before_hours', 1 ) );
         if ( ! $reminder_hours ) return;
@@ -3431,14 +4315,9 @@ class WC_Bank_Receipt_Pro {
 
                 $remaining = $this->remaining_seconds( $order );
                 if ( $remaining > 0 && $remaining <= $reminder_secs ) {
-                    $phone = $order->get_billing_phone();
-                    if ( $phone ) {
-                        $templates = $this->sms_templates();
-                        $tpl = get_option( 'wc_sms_reminder_tpl', $templates['reminder'] );
-                        $this->send_sms( $phone, str_replace( '{order_id}', $order->get_id(), $tpl ), 'reminder', $order->get_id() );
-                    }
-                    // Flag regardless of provider outcome: one reminder per cycle.
-                    // Failures are visible in the SMS log.
+                    // The claim inside sms_send_event makes “one reminder per cycle” true even
+                    // if two cron workers overlap; the flag below keeps the sweep cheap.
+                    $this->sms_send_event( 'reminder', (int) $order->get_id() );
                     $order->update_meta_data( self::META_REMINDER_SENT, 1 );
                     $order->save();
                 }
@@ -3448,54 +4327,20 @@ class WC_Bank_Receipt_Pro {
     }
 
     /**
-     * Send one SMS and record what the provider actually answered.
-     * Statuses: sent | failed | unknown.
+     * Raw transport for one provider. Returns the transport outcome *and* the provider's
+     * own verdict, including the HTTP code, the provider message id and whether the failure
+     * is worth retrying.
+     *
+     * @return array{status:string,response:string,http:int,provider_id:string,retryable:bool}
      */
-    private function send_sms( $phone, $message, $event_type = '', $order_id = 0 ) {
-        /*
-         * Single gate for the whole delivery layer.
-         * SMS is switched off in this release (SMS_UI_ENABLED): no UI, and above all no
-         * message leaves the shop. Nothing is sent, nothing is logged — while the
-         * providers, templates and stored credentials stay exactly as they were, so the
-         * next phase only has to flip the flag back on.
-         */
-        if ( ! self::SMS_UI_ENABLED ) return false;
-
-        $phone    = preg_replace( '/[^0-9+]/', '', (string) $phone );
-        $provider = get_option( 'wc_sms_provider', 'kavenegar' );
-        $sender   = '';
-        if ( $event_type ) {
-            $es = get_option( "wc_sms_{$event_type}_sender" );
-            if ( ! empty( $es ) ) $sender = $es;
-        }
-        if ( empty( $sender ) ) $sender = get_option( "wc_sms_{$provider}_sender", '' );
-
-        if ( '' === $phone ) {
-            $result = array( 'status' => 'failed', 'response' => 'Missing recipient' );
-        } else {
-            $result = $this->send_sms_raw( $phone, $message, $provider, $sender );
-        }
-
-        global $wpdb;
-        $wpdb->insert( $wpdb->prefix . self::DB_PREFIX . 'sms_log', array(
-            'order_id'  => $order_id,
-            'recipient' => $phone,
-            'message'   => $message,
-            'status'    => $result['status'],
-            'response'  => substr( (string) $result['response'], 0, 500 ),
-            'timestamp' => current_time( 'mysql' ),
-        ) );
-
-        return $result['status'];
-    }
-
-    /** @return array{status:string,response:string} */
     private function send_sms_raw( $phone, $message, $provider, $sender = '' ) {
+        $empty = array( 'status' => 'failed', 'response' => '', 'http' => 0, 'provider_id' => '', 'retryable' => false );
+
         switch ( $provider ) {
             case 'kavenegar':
-                $key = get_option( 'wc_sms_kavenegar_apikey' );
-                if ( empty( $key ) ) return array( 'status' => 'failed', 'response' => 'API key missing' );
-                $sender   = $sender ?: get_option( 'wc_sms_kavenegar_sender', '10008663' );
+                $key = (string) get_option( 'wc_sms_kavenegar_apikey' );
+                if ( '' === $key ) return array_merge( $empty, array( 'response' => 'API key missing' ) );
+                $sender   = $sender ?: (string) get_option( 'wc_sms_kavenegar_sender', '10008663' );
                 $response = wp_remote_post(
                     'https://api.kavenegar.com/v1/' . rawurlencode( $key ) . '/sms/send.json',
                     array(
@@ -3506,10 +4351,10 @@ class WC_Bank_Receipt_Pro {
                 return $this->evaluate_sms_response( $response, 'kavenegar' );
 
             case 'melli':
-                $user = get_option( 'wc_sms_melli_username' );
-                $pass = get_option( 'wc_sms_melli_password' );
-                if ( empty( $user ) || empty( $pass ) ) return array( 'status' => 'failed', 'response' => 'Missing credentials' );
-                $sender   = $sender ?: get_option( 'wc_sms_melli_sender' );
+                $user = (string) get_option( 'wc_sms_melli_username' );
+                $pass = (string) get_option( 'wc_sms_melli_password' );
+                if ( '' === $user || '' === $pass ) return array_merge( $empty, array( 'response' => 'Missing credentials' ) );
+                $sender   = $sender ?: (string) get_option( 'wc_sms_melli_sender' );
                 $response = wp_remote_post(
                     'https://rest.payamak-panel.com/api/SendSMS/SendSMS',
                     array(
@@ -3520,128 +4365,113 @@ class WC_Bank_Receipt_Pro {
                 return $this->evaluate_sms_response( $response, 'melli' );
 
             case 'custom':
-                $url    = get_option( 'wc_sms_custom_url' );
-                $apikey = get_option( 'wc_sms_custom_apikey' );
-                if ( empty( $url ) ) return array( 'status' => 'failed', 'response' => 'URL missing' );
-                $sender = $sender ?: get_option( 'wc_sms_custom_sender' );
+                $url    = (string) get_option( 'wc_sms_custom_url' );
+                $apikey = (string) get_option( 'wc_sms_custom_apikey' );
+                if ( '' === $url ) return array_merge( $empty, array( 'response' => 'URL missing' ) );
+                $sender = $sender ?: (string) get_option( 'wc_sms_custom_sender' );
                 $args   = array( 'body' => array( 'to' => $phone, 'message' => $message, 'sender' => $sender ), 'timeout' => 15 );
-                if ( ! empty( $apikey ) ) $args['headers'] = array( 'Authorization' => 'Bearer ' . $apikey );
+                if ( '' !== $apikey ) $args['headers'] = array( 'Authorization' => 'Bearer ' . $apikey );
                 return $this->evaluate_sms_response( wp_remote_post( $url, $args ), 'custom' );
         }
-        return array( 'status' => 'failed', 'response' => 'Unknown SMS provider' );
+        return array_merge( $empty, array( 'response' => 'Unknown SMS provider' ) );
     }
 
     /**
      * A send only counts as “sent” when the transport AND the provider say so.
-     * - WP_Error / non-2xx / provider error payload → failed
-     * - 2xx with a body we cannot parse → unknown (never silently “sent”)
+     *   WP_Error / 5xx / 429 / timeout → failed, retryable
+     *   4xx (except 429)               → failed, permanent
+     *   provider error payload         → failed, judged per provider
+     *   2xx with a body we cannot read → unknown (never silently “sent”), retryable once
      */
     private function evaluate_sms_response( $response, $provider ) {
         if ( is_wp_error( $response ) ) {
-            return array( 'status' => 'failed', 'response' => $response->get_error_message() );
+            // Connection failures are transient by nature: retry them.
+            return array(
+                'status'      => 'failed',
+                'response'    => $response->get_error_message(),
+                'http'        => 0,
+                'provider_id' => '',
+                'retryable'   => true,
+            );
         }
+
         $code = (int) wp_remote_retrieve_response_code( $response );
         $body = (string) wp_remote_retrieve_body( $response );
+
         if ( $code < 200 || $code >= 300 ) {
-            return array( 'status' => 'failed', 'response' => 'HTTP ' . $code . ' — ' . $body );
+            return array(
+                'status'      => 'failed',
+                'response'    => 'HTTP ' . $code . ' — ' . substr( $body, 0, 300 ),
+                'http'        => $code,
+                'provider_id' => '',
+                // Server-side and rate-limit errors can pass; a 4xx (bad credentials, bad
+                // number) will repeat exactly as it failed.
+                'retryable'   => ( $code >= 500 || 429 === $code || 408 === $code ),
+            );
         }
 
         if ( 'custom' === $provider ) {
-            return array( 'status' => 'sent', 'response' => $body ? $body : 'HTTP ' . $code );
+            // A generic endpoint gets no provider-specific parsing: a 2xx with a body is the
+            // contract, and the body is kept for the log.
+            return array(
+                'status'      => 'sent',
+                'response'    => $body ? $body : 'HTTP ' . $code,
+                'http'        => $code,
+                'provider_id' => '',
+                'retryable'   => false,
+            );
         }
 
         $json = json_decode( $body, true );
         if ( ! is_array( $json ) ) {
-            return array( 'status' => 'unknown', 'response' => 'Unparsable response: ' . $body );
+            return array(
+                'status'      => 'unknown',
+                'response'    => 'Unparsable response: ' . substr( $body, 0, 300 ),
+                'http'        => $code,
+                'provider_id' => '',
+                // The message may or may not have gone out: retrying once is the honest
+                // option, and the log shows that it was a retry.
+                'retryable'   => true,
+            );
         }
 
         if ( 'kavenegar' === $provider ) {
             $status = isset( $json['return']['status'] ) ? (int) $json['return']['status'] : 0;
+            $id     = '';
+            if ( isset( $json['entries'][0]['messageid'] ) ) $id = (string) $json['entries'][0]['messageid'];
             if ( $status >= 200 && $status < 300 ) {
-                return array( 'status' => 'sent', 'response' => $body );
+                return array( 'status' => 'sent', 'response' => $body, 'http' => $code, 'provider_id' => $id, 'retryable' => false );
             }
-            return array( 'status' => 'failed', 'response' => 'API status ' . $status . ' — ' . ( $json['return']['message'] ?? '' ) );
+            return array(
+                'status'      => 'failed',
+                'response'    => 'API status ' . $status . ' — ' . (string) ( $json['return']['message'] ?? '' ),
+                'http'        => $code,
+                'provider_id' => $id,
+                'retryable'   => in_array( $status, array( 500, 501, 502, 503, 504, 505, 506, 507, 508 ), true ),
+            );
         }
 
         if ( 'melli' === $provider ) {
             $ret = isset( $json['RetStatus'] ) ? (int) $json['RetStatus'] : 0;
+            $id  = isset( $json['Value'] ) ? (string) $json['Value'] : '';
             if ( 1 === $ret ) {
-                return array( 'status' => 'sent', 'response' => $body );
+                return array( 'status' => 'sent', 'response' => $body, 'http' => $code, 'provider_id' => $id, 'retryable' => false );
             }
-            return array( 'status' => 'failed', 'response' => 'API status ' . $ret . ' — ' . ( $json['StrRetStatus'] ?? '' ) );
+            return array(
+                'status'      => 'failed',
+                'response'    => 'API status ' . $ret . ' — ' . (string) ( $json['StrRetStatus'] ?? '' ),
+                'http'        => $code,
+                'provider_id' => $id,
+                'retryable'   => in_array( $ret, array( 2, 5, 6, 8 ), true ),
+            );
         }
 
-        return array( 'status' => 'unknown', 'response' => $body );
+        return array( 'status' => 'unknown', 'response' => substr( $body, 0, 300 ), 'http' => $code, 'provider_id' => '', 'retryable' => false );
     }
 
-    // =========================================================================
-    // SMS LOG PAGE
-    // =========================================================================
-
-    public function sms_log_page() {
-        if ( ! self::SMS_UI_ENABLED ) {
-            wp_die( esc_html__( 'این بخش فعلاً غیرفعال است.', 'wc-bank-receipt' ), '', array( 'response' => 403 ) );
-        }
-        global $wpdb;
-        $table    = $wpdb->prefix . self::DB_PREFIX . 'sms_log';
-        $per_page = 20;
-        $page     = max( 1, absint( $_GET['paged'] ?? 1 ) );
-        $offset   = ( $page - 1 ) * $per_page;
-        $total    = (int) $wpdb->get_var( "SELECT COUNT(*) FROM $table" );
-        $logs     = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per_page, $offset ) );
-        ?>
-        <div class="wcr-wrap">
-            <div class="wcr-header">
-                <span class="dashicons dashicons-email-alt"></span>
-                <h1><?php _e( 'تاریخچه پیامک‌ها', 'wc-bank-receipt' ); ?></h1>
-            </div>
-            <div class="wcr-card">
-                <table class="wcr-tbl">
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th><?php _e( 'سفارش', 'wc-bank-receipt' ); ?></th>
-                            <th><?php _e( 'گیرنده', 'wc-bank-receipt' ); ?></th>
-                            <th><?php _e( 'متن', 'wc-bank-receipt' ); ?></th>
-                            <th><?php _e( 'وضعیت', 'wc-bank-receipt' ); ?></th>
-                            <th><?php _e( 'زمان', 'wc-bank-receipt' ); ?></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    <?php if ( $logs ) : foreach ( $logs as $l ) : ?>
-                        <tr>
-                            <td><?php echo $l->id; ?></td>
-                            <td><?php echo $l->order_id ? '<a href="' . esc_url(get_edit_post_link($l->order_id)) . '">#'.$l->order_id.'</a>' : '—'; ?></td>
-                            <td><?php echo esc_html($l->recipient); ?></td>
-                            <td title="<?php echo esc_attr($l->message); ?>"><?php echo esc_html(mb_strimwidth($l->message,0,55,'...')); ?></td>
-                            <td><?php echo $l->status==='sent' ? '<span class="wcr-badge ok">✓ ارسال</span>' : '<span class="wcr-badge err">✗ ناموفق</span>'; ?></td>
-                            <td><?php echo esc_html($l->timestamp); ?></td>
-                        </tr>
-                    <?php endforeach; else : ?>
-                        <tr><td colspan="6" style="text-align:center;padding:30px;color:#90a4ae;"><?php _e('هنوز پیامکی ارسال نشده.','wc-bank-receipt'); ?></td></tr>
-                    <?php endif; ?>
-                    </tbody>
-                </table>
-                <?php
-                $pages = ceil( $total / $per_page );
-                if ( $pages > 1 ) {
-                    echo '<div class="tablenav" style="margin-top:16px;"><div class="tablenav-pages">';
-                    echo paginate_links( array(
-                        'base'=>add_query_arg('paged','%#%'),
-                        'format'=>'','prev_text'=>'&laquo;','next_text'=>'&raquo;',
-                        'total'=>$pages,'current'=>$page,
-                    ) );
-                    echo '</div></div>';
-                }
-                ?>
-            </div>
-        </div>
-        <?php
-    }
-
-    // =========================================================================
-    // SMS SETTINGS PAGE
-    // =========================================================================
+    // ------------------------------------------------------------------
+    // ADMIN UI: SETTINGS
+    // ------------------------------------------------------------------
 
     /** Show only that a secret exists — never the value itself. */
     private function masked_secret( $option_name ) {
@@ -3651,118 +4481,522 @@ class WC_Bank_Receipt_Pro {
         return '••••••••' . $tail;
     }
 
+    /** The settings screen: provider + credentials, one block per event, preview + test. */
     public function sms_settings_page() {
-        // The SMS tab is not registered in this release, and the route is closed as well:
-        // a direct URL must not reach the (intact) credentials UI.
-        if ( ! self::SMS_UI_ENABLED ) {
-            wp_die( esc_html__( 'این بخش فعلاً غیرفعال است.', 'wc-bank-receipt' ), '', array( 'response' => 403 ) );
-        }
-        if ( ! current_user_can( 'manage_options' ) ) {
+        if ( ! current_user_can( self::CAP_MANAGE ) ) {
             wp_die( esc_html__( 'دسترسی غیرمجاز', 'wc-bank-receipt' ), '', array( 'response' => 403 ) );
         }
-        $provider = get_option('wc_sms_provider','kavenegar');
+
+        $notice = '';
+        $notice_class = 'notice-success';
+
+        // Explicit test send: nonce + capability, and only ever a hand-typed number.
+        if ( isset( $_POST['wcr_sms_test'] ) ) {
+            if ( ! check_admin_referer( 'wc_receipt_sms_test' ) ) {
+                $notice = __( 'درخواست نامعتبر است.', 'wc-bank-receipt' );
+                $notice_class = 'notice-error';
+            } else {
+                $event  = sanitize_key( wp_unslash( $_POST['test_event'] ?? '' ) );
+                $phone  = sanitize_text_field( wp_unslash( $_POST['test_phone'] ?? '' ) );
+                $tpl    = isset( $_POST['test_template'] ) ? wp_unslash( $_POST['test_template'] ) : '';
+                $status = sanitize_key( wp_unslash( $_POST['test_status'] ?? '' ) );
+                $result = $this->sms_send_test( $event, $phone, is_string( $tpl ) ? $tpl : '', $status );
+                $notice = (string) $result['message'];
+                $notice_class = ( 'sent' === $result['status'] ) ? 'notice-success' : 'notice-error';
+            }
+        }
+
+        $events   = $this->sms_events();
+        $statuses = $this->sms_status_choices();
+        $provider = (string) get_option( 'wc_sms_provider', 'kavenegar' );
+        $enabled  = self::sms_master_enabled();
         ?>
         <div class="wcr-wrap">
             <div class="wcr-header">
-                <span class="dashicons dashicons-smartphone"></span>
-                <h1><?php _e('تنظیمات پیام‌رسانی','wc-bank-receipt'); ?></h1>
+                <span class="dashicons dashicons-email-alt"></span>
+                <h1><?php _e( 'تنظیمات پیامک', 'wc-bank-receipt' ); ?></h1>
             </div>
 
+            <?php if ( $notice ) : ?>
+                <div class="notice <?php echo esc_attr( $notice_class ); ?> is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
+            <?php endif; ?>
+
+            <?php
+            /*
+             * ONE form for the whole SMS configuration.
+             *
+             * Provider, credentials, switches and templates are saved together, because
+             * `options.php` submits a settings group as a whole: two separate forms would
+             * each have to re-post the other's fields (hidden inputs) and an admin who
+             * saved the second one would silently roll back the first.
+             */
+            ?>
             <form method="post" action="options.php">
-                <?php settings_fields('wc_sms_group'); ?>
-
-                <div class="wcr-card">
-                    <h2><span class="dashicons dashicons-admin-generic"></span> <?php _e('تنظیمات سرویس','wc-bank-receipt'); ?></h2>
-
-                    <div class="wcr-tabs" id="sms-tabs">
-                        <?php foreach(self::SMS_PROVIDERS as $k=>$lbl): ?>
-                            <button type="button" class="wcr-tab<?php echo $provider===$k?' active':''; ?>" data-tab="<?php echo $k; ?>"><?php echo $lbl; ?></button>
-                        <?php endforeach; ?>
-                    </div>
-
-                    <!-- Kavenegar -->
-                    <div class="wcr-tab-pane<?php echo $provider==='kavenegar'?' active':''; ?>" id="tab-kavenegar">
-                        <table class="wcr-ftbl">
-                            <tr><th><?php _e('کلید API','wc-bank-receipt'); ?></th><td><input type="password" name="wc_sms_kavenegar_apikey" value="" placeholder="<?php echo esc_attr( $this->masked_secret( 'wc_sms_kavenegar_apikey' ) ); ?>" dir="ltr" autocomplete="new-password"><p class="wcr-hint"><?php esc_html_e( 'خالی گذاشتن = بدون تغییر · «-» = پاک‌کردن مقدار ذخیره‌شده', 'wc-bank-receipt' ); ?></p></td></tr>
-                            <tr><th><?php _e('شماره فرستنده','wc-bank-receipt'); ?></th><td><input type="text" name="wc_sms_kavenegar_sender" value="<?php echo esc_attr(get_option('wc_sms_kavenegar_sender','10008663')); ?>" dir="ltr"></td></tr>
-                        </table>
-                    </div>
-
-                    <!-- Melli -->
-                    <div class="wcr-tab-pane<?php echo $provider==='melli'?' active':''; ?>" id="tab-melli">
-                        <table class="wcr-ftbl">
-                            <tr><th><?php _e('نام کاربری','wc-bank-receipt'); ?></th><td><input type="text" name="wc_sms_melli_username" value="<?php echo esc_attr(get_option('wc_sms_melli_username')); ?>" dir="ltr"></td></tr>
-                            <tr><th><?php _e('رمز عبور','wc-bank-receipt'); ?></th><td><input type="password" name="wc_sms_melli_password" value="" placeholder="<?php echo esc_attr( $this->masked_secret( 'wc_sms_melli_password' ) ); ?>" dir="ltr" autocomplete="new-password"><p class="wcr-hint"><?php esc_html_e( 'خالی گذاشتن = بدون تغییر · «-» = پاک‌کردن مقدار ذخیره‌شده', 'wc-bank-receipt' ); ?></p></td></tr>
-                            <tr><th><?php _e('شماره فرستنده','wc-bank-receipt'); ?></th><td><input type="text" name="wc_sms_melli_sender" value="<?php echo esc_attr(get_option('wc_sms_melli_sender')); ?>" dir="ltr"></td></tr>
-                        </table>
-                    </div>
-
-                    <!-- Custom -->
-                    <div class="wcr-tab-pane<?php echo $provider==='custom'?' active':''; ?>" id="tab-custom">
-                        <table class="wcr-ftbl">
-                            <tr><th><?php _e('آدرس API','wc-bank-receipt'); ?></th><td><input type="url" name="wc_sms_custom_url" value="<?php echo esc_attr(get_option('wc_sms_custom_url')); ?>" dir="ltr" placeholder="https://..."></td></tr>
-                            <tr><th><?php _e('کلید API','wc-bank-receipt'); ?></th><td><input type="password" name="wc_sms_custom_apikey" value="" placeholder="<?php echo esc_attr( $this->masked_secret( 'wc_sms_custom_apikey' ) ); ?>" dir="ltr" autocomplete="new-password"><p class="wcr-hint"><?php esc_html_e( 'خالی گذاشتن = بدون تغییر · «-» = پاک‌کردن مقدار ذخیره‌شده', 'wc-bank-receipt' ); ?></p></td></tr>
-                            <tr><th><?php _e('شماره فرستنده','wc-bank-receipt'); ?></th><td><input type="text" name="wc_sms_custom_sender" value="<?php echo esc_attr(get_option('wc_sms_custom_sender')); ?>" dir="ltr"></td></tr>
-                        </table>
-                    </div>
-
-                    <!-- Hidden field for selected provider -->
-                    <input type="hidden" name="wc_sms_provider" id="sms_provider_val" value="<?php echo esc_attr($provider); ?>">
-                </div>
-
-                <div class="wcr-card">
-                    <h2><span class="dashicons dashicons-format-chat"></span> <?php _e('قالب‌های پیامکی','wc-bank-receipt'); ?></h2>
-                    <p class="wcr-hint" style="margin-bottom:16px;"><?php _e('متغیر {order_id} با شماره سفارش جایگزین می‌شود.','wc-bank-receipt'); ?></p>
+            <?php settings_fields( 'wc_sms_group' ); ?>
+            <div class="wcr-card">
+                <h2><span class="dashicons dashicons-admin-generic"></span> <?php _e( 'وضعیت سرویس', 'wc-bank-receipt' ); ?></h2>
                     <table class="wcr-ftbl">
-                    <?php
-                    $tpls = array(
-                        'approved'     => array(__('تأیید فیش','wc-bank-receipt'),      __('مشتری گرامی، فیش سفارش {order_id} تأیید شد.','wc-bank-receipt')),
-                        'rejected'     => array(__('رد فیش','wc-bank-receipt'),          __('مشتری گرامی، فیش سفارش {order_id} رد شد. لطفاً مجدد ارسال کنید.','wc-bank-receipt')),
-                        'reminder'     => array(__('یادآوری پرداخت','wc-bank-receipt'),  __('مشتری گرامی، مهلت پرداخت سفارش {order_id} رو به اتمام است.','wc-bank-receipt')),
-                        'cancelled'    => array(__('ابطال سفارش','wc-bank-receipt'),     __('سفارش {order_id} به دلیل عدم پرداخت لغو شد.','wc-bank-receipt')),
-                        'admin_upload' => array(__('اطلاع به مدیر (آپلود جدید)','wc-bank-receipt'), __('فیش جدید برای سفارش {order_id} بارگذاری شد.','wc-bank-receipt')),
-                    );
-                    foreach($tpls as $key=>list($label,$default)): ?>
                         <tr>
-                            <th><?php echo $label; ?></th>
+                            <th><?php _e( 'سرویس پیامک', 'wc-bank-receipt' ); ?></th>
                             <td>
-                                <textarea name="wc_sms_<?php echo $key; ?>_tpl" rows="2" class="large-text"><?php echo esc_textarea(get_option("wc_sms_{$key}_tpl",$default)); ?></textarea>
-                                <p class="wcr-hint"><?php _e('خط اختصاصی (اختیاری):','wc-bank-receipt'); ?> <input type="text" name="wc_sms_<?php echo $key; ?>_sender" value="<?php echo esc_attr(get_option("wc_sms_{$key}_sender")); ?>" dir="ltr" style="max-width:160px;"></p>
+                                <label>
+                                    <input type="checkbox" name="wc_sms_enabled" value="yes" <?php checked( $enabled ); ?>>
+                                    <?php _e( 'فعال بودن ارسال پیامک', 'wc-bank-receipt' ); ?>
+                                </label>
+                                <p class="wcr-hint"><?php _e( 'تا زمانی که این گزینه خاموش است هیچ پیامکی ارسال و هیچ رکوردی ثبت نمی‌شود — حتی اگر الگوها و کلیدها تنظیم شده باشند.', 'wc-bank-receipt' ); ?></p>
                             </td>
                         </tr>
-                    <?php endforeach; ?>
                         <tr>
-                            <th><?php _e('شماره مدیر','wc-bank-receipt'); ?></th>
-                            <td><input type="text" name="wc_sms_admin_phone" value="<?php echo esc_attr(get_option('wc_sms_admin_phone')); ?>" dir="ltr" placeholder="09xxxxxxxxx"></td>
+                            <th><?php _e( 'ارائه‌دهنده', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <select name="wc_sms_provider">
+                                    <?php foreach ( self::SMS_PROVIDERS as $slug => $label ) : ?>
+                                        <option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $provider, $slug ); ?>><?php echo esc_html( $label ); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </td>
                         </tr>
                         <tr>
-                            <th><?php _e('یادآوری چند ساعت قبل از مهلت','wc-bank-receipt'); ?></th>
+                            <th><?php _e( 'شماره مدیر برای اطلاع فیش جدید', 'wc-bank-receipt' ); ?></th>
                             <td>
-                                <input type="number" min="0" name="wc_sms_reminder_before_hours" value="<?php echo esc_attr(get_option('wc_sms_reminder_before_hours',1)); ?>" style="max-width:80px;">
-                                <span class="wcr-hint"><?php _e('ساعت — صفر=غیرفعال','wc-bank-receipt'); ?></span>
+                                <input type="text" name="wc_sms_admin_phone" value="<?php echo esc_attr( get_option( 'wc_sms_admin_phone', '' ) ); ?>" placeholder="09xxxxxxxxx">
+                                <p class="wcr-hint"><?php _e( 'خالی بگذارید تا پیامک «فیش جدید» به مدیر ارسال نشود.', 'wc-bank-receipt' ); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'یادآوری پیش از پایان مهلت', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="number" min="0" max="72" name="wc_sms_reminder_before_hours" style="max-width:90px;"
+                                       value="<?php echo esc_attr( absint( get_option( 'wc_sms_reminder_before_hours', 1 ) ) ); ?>">
+                                <span class="wcr-hint"><?php _e( 'ساعت قبل از پایان مهلت — صفر یعنی یادآوری ارسال نشود.', 'wc-bank-receipt' ); ?></span>
                             </td>
                         </tr>
                     </table>
-                </div>
+                    <h3><span class="dashicons dashicons-lock"></span> <?php _e( 'کلیدها و اطلاعات ورود', 'wc-bank-receipt' ); ?></h3>
+                    <table class="wcr-ftbl">
+                        <tr>
+                            <th><?php _e( 'کلید API کاوه‌نگار', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="password" name="wc_sms_kavenegar_apikey" value="<?php echo esc_attr( get_option( 'wc_sms_kavenegar_apikey', '' ) ); ?>" autocomplete="off">
+                                <p class="wcr-hint"><?php echo esc_html( $this->masked_secret( 'wc_sms_kavenegar_apikey' ) ); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'نام کاربری / رمز ملی پیامک', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="text" name="wc_sms_melli_username" value="<?php echo esc_attr( get_option( 'wc_sms_melli_username', '' ) ); ?>" style="max-width:220px;">
+                                <input type="password" name="wc_sms_melli_password" value="<?php echo esc_attr( get_option( 'wc_sms_melli_password', '' ) ); ?>" autocomplete="off" style="max-width:220px;">
+                                <p class="wcr-hint"><?php echo esc_html( $this->masked_secret( 'wc_sms_melli_password' ) ); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'درگاه سفارشی', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="url" name="wc_sms_custom_url" value="<?php echo esc_attr( get_option( 'wc_sms_custom_url', '' ) ); ?>" placeholder="https://…">
+                                <input type="password" name="wc_sms_custom_apikey" value="<?php echo esc_attr( get_option( 'wc_sms_custom_apikey', '' ) ); ?>" autocomplete="off">
+                                <p class="wcr-hint"><?php _e( 'درخواست به‌صورت POST با فیلدهای to، message و sender ارسال می‌شود.', 'wc-bank-receipt' ); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'شماره فرستنده', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="text" name="wc_sms_kavenegar_sender" value="<?php echo esc_attr( get_option( 'wc_sms_kavenegar_sender', '' ) ); ?>" placeholder="10008663" style="max-width:180px;">
+                                <input type="text" name="wc_sms_melli_sender" value="<?php echo esc_attr( get_option( 'wc_sms_melli_sender', '' ) ); ?>" style="max-width:180px;">
+                                <input type="text" name="wc_sms_custom_sender" value="<?php echo esc_attr( get_option( 'wc_sms_custom_sender', '' ) ); ?>" style="max-width:180px;">
+                                <p class="wcr-hint"><?php _e( 'برای هر ارائه‌دهنده یک مقدار؛ خالی بماند از پیش‌فرض همان سرویس استفاده می‌شود.', 'wc-bank-receipt' ); ?></p>
+                            </td>
+                        </tr>
+                    </table>
+            </div>
 
-                <?php submit_button(__('ذخیره تنظیمات پیامک','wc-bank-receipt')); ?>
+            <div class="wcr-card">
+                <h2><span class="dashicons dashicons-edit"></span> <?php _e( 'الگوها و رویدادها', 'wc-bank-receipt' ); ?></h2>
+                <p class="wcr-hint" style="margin-bottom:14px;">
+                    <?php _e( 'متغیرهای مجاز:', 'wc-bank-receipt' ); ?>
+                    <span id="wcr-sms-vars"><?php
+                        foreach ( array_keys( $this->sms_sample_map() ) as $var ) {
+                            echo '<button type="button" class="button button-small wcr-var" data-var="{' . esc_attr( $var ) . '}">{' . esc_html( $var ) . '}</button> ';
+                        }
+                    ?></span>
+                </p>
+                <p class="wcr-hint"><?php _e( 'با کلیک روی هر متغیر، به انتهای الگوی فعال اضافه می‌شود. متغیر ناشناخته در پیام دست‌نخورده می‌ماند و در پیش‌نمایش هشدار داده می‌شود.', 'wc-bank-receipt' ); ?></p>
+
+                    <?php foreach ( $events as $slug => $spec ) : ?>
+                        <div class="wcr-card" style="box-shadow:none;border:1.5px solid var(--wcr-border);margin-bottom:16px;">
+                            <h3 style="margin-top:0;">
+                                <?php echo esc_html( $spec['label'] ); ?>
+                                <?php if ( 'admin' === $spec['audience'] ) : ?>
+                                    <span class="wcr-badge info"><?php _e( 'به مدیر', 'wc-bank-receipt' ); ?></span>
+                                <?php else : ?>
+                                    <span class="wcr-badge muted"><?php _e( 'به مشتری', 'wc-bank-receipt' ); ?></span>
+                                <?php endif; ?>
+                            </h3>
+                            <p>
+                                <label>
+                                    <input type="checkbox" name="<?php echo esc_attr( $spec['opt_enabled'] ); ?>" value="yes"
+                                        <?php checked( 'yes', get_option( $spec['opt_enabled'], $spec['default_enabled'] ) ); ?>>
+                                    <?php _e( 'ارسال خودکار این پیامک فعال باشد', 'wc-bank-receipt' ); ?>
+                                </label>
+                            </p>
+                            <textarea class="large-text wcr-sms-tpl" rows="2" style="direction:rtl;"
+                                      name="<?php echo esc_attr( $spec['opt_template'] ); ?>"><?php echo esc_textarea( $this->sms_template_for( $slug ) ); ?></textarea>
+                            <p class="wcr-hint wcr-sms-info" data-for="<?php echo esc_attr( $spec['opt_template'] ); ?>"></p>
+
+                            <?php if ( 'status_change' === $slug ) : ?>
+                                <table class="wcr-ftbl" style="margin-top:8px;">
+                                    <?php foreach ( $statuses as $status_slug => $status_label ) : ?>
+                                        <tr>
+                                            <th style="width:170px;"><?php echo esc_html( $status_label ); ?></th>
+                                            <td>
+                                                <label>
+                                                    <input type="checkbox" name="<?php echo esc_attr( $this->sms_status_option( $status_slug, 'enabled' ) ); ?>" value="yes"
+                                                        <?php checked( 'yes', get_option( $this->sms_status_option( $status_slug, 'enabled' ), 'no' ) ); ?>>
+                                                    <?php printf( esc_html__( 'ارسال پیامک برای وضعیت «%s»', 'wc-bank-receipt' ), esc_html( $status_label ) ); ?>
+                                                </label>
+                                                <input type="text" class="large-text" style="margin-top:6px;direction:rtl;"
+                                                       name="<?php echo esc_attr( $this->sms_status_option( $status_slug, 'tpl' ) ); ?>"
+                                                       value="<?php echo esc_attr( get_option( $this->sms_status_option( $status_slug, 'tpl' ), '' ) ); ?>"
+                                                       placeholder="<?php echo esc_attr( $spec['default'] ); ?>">
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </table>
+                            <?php endif; ?>
+
+                            <p>
+                                <button type="button" class="button wcr-sms-preview"
+                                        data-event="<?php echo esc_attr( $slug ); ?>"
+                                        data-field="<?php echo esc_attr( $spec['opt_template'] ); ?>"
+                                        data-nonce="<?php echo esc_attr( wp_create_nonce( 'wc_receipt_sms_preview' ) ); ?>"
+                                        data-ajax="<?php echo esc_url( admin_url( 'admin-ajax.php' ) ); ?>">
+                                    <?php _e( 'پیش‌نمایش با داده نمونه', 'wc-bank-receipt' ); ?>
+                                </button>
+                                <span class="wcr-hint wcr-sms-preview-out" data-out="<?php echo esc_attr( $spec['opt_template'] ); ?>" aria-live="polite"></span>
+                            </p>
+                        </div>
+                    <?php endforeach; ?>
+
+            </div>
+
+            <?php submit_button( __( 'ذخیره تنظیمات پیامک', 'wc-bank-receipt' ) ); ?>
             </form>
+
+            <div class="wcr-card">
+                <h2><span class="dashicons dashicons-phone"></span> <?php _e( 'ارسال آزمایشی', 'wc-bank-receipt' ); ?></h2>
+                <p class="wcr-hint"><?php _e( 'فقط با کلیک شما ارسال می‌شود، با داده نمونه ساخته می‌شود و در تاریخچه با رویداد «test» ثبت می‌گردد. پیش‌نمایش هیچ پیامکی ارسال نمی‌کند.', 'wc-bank-receipt' ); ?></p>
+                <form method="post">
+                    <?php wp_nonce_field( 'wc_receipt_sms_test' ); ?>
+                    <table class="wcr-ftbl">
+                        <tr>
+                            <th><?php _e( 'شمارهٔ گیرنده', 'wc-bank-receipt' ); ?></th>
+                            <td><input type="text" name="test_phone" placeholder="09xxxxxxxxx" required></td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'رویداد', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <select name="test_event">
+                                    <?php foreach ( $events as $slug => $spec ) : ?>
+                                        <option value="<?php echo esc_attr( $slug ); ?>"><?php echo esc_html( $spec['label'] ); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </td>
+                        </tr>
+                    </table>
+                    <button type="submit" name="wcr_sms_test" value="1" class="button button-primary"><?php _e( 'ارسال پیام آزمایشی', 'wc-bank-receipt' ); ?></button>
+                </form>
+            </div>
         </div>
+
         <script>
-        (function(){
-            var tabs = document.querySelectorAll('.wcr-tab');
-            var pval = document.getElementById('sms_provider_val');
-            tabs.forEach(function(tab){
-                tab.addEventListener('click',function(){
-                    tabs.forEach(function(t){ t.classList.remove('active'); });
-                    document.querySelectorAll('.wcr-tab-pane').forEach(function(p){ p.classList.remove('active'); });
-                    tab.classList.add('active');
-                    document.getElementById('tab-'+tab.dataset.tab).classList.add('active');
-                    pval.value = tab.dataset.tab;
+        (function () {
+            var VARS = <?php echo wp_json_encode( array_map( function ( $v ) { return '{' . $v . '}'; }, array_keys( $this->sms_sample_map() ) ) ); ?>;
+            var TEXT = {
+                unknown: '<?php echo esc_js( __( 'متغیر ناشناخته:', 'wc-bank-receipt' ) ); ?>',
+                parts:   '<?php echo esc_js( __( 'کاراکتر — ', 'wc-bank-receipt' ) ); ?>',
+                part:    '<?php echo esc_js( __( 'بخش', 'wc-bank-receipt' ) ); ?>',
+                empty:   '<?php echo esc_js( __( 'متن الگو خالی است.', 'wc-bank-receipt' ) ); ?>',
+                error:   '<?php echo esc_js( __( 'پیش‌نمایش ممکن نشد.', 'wc-bank-receipt' ) ); ?>'
+            };
+
+            /* Which textarea the variable buttons insert into: the last one focused. */
+            var active = null;
+            var areas = document.querySelectorAll('.wcr-sms-tpl');
+            for (var i = 0; i < areas.length; i++) {
+                areas[i].addEventListener('focus', function () { active = this; });
+            }
+            var buttons = document.querySelectorAll('.wcr-var');
+            for (var b = 0; b < buttons.length; b++) {
+                buttons[b].addEventListener('click', function () {
+                    var token = this.getAttribute('data-var');
+                    var target = active || areas[0];
+                    if (!target) return;
+                    target.value += token;
+                    target.focus();
                 });
-            });
+            }
+
+            /* Length + unknown-variable report, computed locally so it is instant. */
+            function report(area, out) {
+                if (!area || !out) return;
+                var text = area.value || '';
+                if (!text.trim()) { out.textContent = TEXT.empty; return; }
+                var unknown = [];
+                var re = /\{([a-z0-9_]+)\}/gi, m;
+                while ((m = re.exec(text)) !== null) {
+                    if (VARS.indexOf('{' + m[1].toLowerCase() + '}') === -1 && unknown.indexOf(m[0]) === -1) unknown.push(m[0]);
+                }
+                var gsm = /^[A-Za-z0-9 @£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ!"#¤%&'()*+,\-.\/:;<=>?¡ÄÖÑÜ§¿äöñüà\r\n]*$/.test(text);
+                var single = gsm ? 160 : 70, multi = gsm ? 153 : 67;
+                var parts = text.length <= single ? 1 : Math.ceil(text.length / multi);
+                out.textContent = text.length + ' ' + TEXT.parts + parts + ' ' + TEXT.part
+                    + (unknown.length ? ' — ' + TEXT.unknown + ' ' + unknown.join(', ') : '');
+            }
+
+            var infos = document.querySelectorAll('.wcr-sms-tpl');
+            for (var k = 0; k < infos.length; k++) {
+                (function (area) {
+                    var out = document.querySelector('.wcr-sms-info[data-for="' + area.getAttribute('name') + '"]');
+                    var update = function () { report(area, out); };
+                    area.addEventListener('input', update);
+                    update();
+                })(infos[k]);
+            }
+
+            /* Server-side preview: the same renderer that builds the real message. */
+            var previews = document.querySelectorAll('.wcr-sms-preview');
+            for (var p = 0; p < previews.length; p++) {
+                previews[p].addEventListener('click', function () {
+                    var btn = this;
+                    var field = btn.getAttribute('data-field');
+                    var area = document.querySelector('.wcr-sms-tpl[name="' + field + '"]');
+                    var out = document.querySelector('.wcr-sms-preview-out[data-out="' + field + '"]');
+                    if (!area || !out) return;
+                    out.textContent = '…';
+                    var body = 'action=wcr_sms_preview&nonce=' + encodeURIComponent(btn.getAttribute('data-nonce') || (window.WCR_SMS && window.WCR_SMS.nonce) || '')
+                        + '&event=' + encodeURIComponent(btn.getAttribute('data-event'))
+                        + '&template=' + encodeURIComponent(area.value);
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', btn.getAttribute('data-ajax') || (window.WCR_SMS && window.WCR_SMS.ajax) || window.ajaxurl || '', true);
+                    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState !== 4) return;
+                        var data = null;
+                        try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+                        if (!data || !data.success) { out.textContent = TEXT.error; return; }
+                        out.textContent = '«' + data.data.preview + '»' + (data.data.unknown && data.data.unknown.length ? ' — ' + TEXT.unknown + ' ' + data.data.unknown.join(', ') : '');
+                    };
+                    xhr.send(body);
+                });
+            }
         })();
         </script>
+        <?php
+    }
+
+    /**
+     * Server-side preview: renders the template exactly like a real message, with the sample
+     * data, and sends nothing.
+     */
+    public function ajax_sms_preview() {
+        if ( ! check_ajax_referer( 'wc_receipt_sms_preview', 'nonce', false ) ) {
+            wp_send_json_error( array( 'message' => __( 'درخواست نامعتبر است.', 'wc-bank-receipt' ) ), 403 );
+        }
+        if ( ! current_user_can( self::CAP_MANAGE ) ) {
+            wp_send_json_error( array( 'message' => __( 'دسترسی غیرمجاز', 'wc-bank-receipt' ) ), 403 );
+        }
+
+        $event    = sanitize_key( wp_unslash( $_POST['event'] ?? '' ) );
+        $template = isset( $_POST['template'] ) ? wp_unslash( $_POST['template'] ) : '';
+        $status   = sanitize_key( wp_unslash( $_POST['status'] ?? '' ) );
+
+        if ( '' === trim( (string) $template ) ) {
+            $template = $this->sms_template_for( $event, $status );
+        }
+        if ( '' === trim( (string) $template ) ) {
+            wp_send_json_error( array( 'message' => __( 'متنی برای پیش‌نمایش وجود ندارد.', 'wc-bank-receipt' ) ), 400 );
+        }
+
+        $map  = $this->sms_sample_map();
+        $text = $this->sms_render_map( (string) $template, $map );
+        $info = $this->sms_length_info( $text );
+
+        wp_send_json_success( array(
+            'preview' => $text,
+            'unknown' => $this->sms_unknown_variables( (string) $template, $map ),
+            'length'  => $info,
+            'sample'  => true,
+        ) );
+    }
+
+    // ------------------------------------------------------------------
+    // ADMIN UI: LOG
+    // ------------------------------------------------------------------
+
+    /**
+     * The delivery history: filterable, paginated, and complete enough to debug a provider
+     * without reading the database. Credentials are never part of what is shown.
+     */
+    public function sms_log_page() {
+        if ( ! current_user_can( self::CAP_MANAGE ) ) {
+            wp_die( esc_html__( 'دسترسی غیرمجاز', 'wc-bank-receipt' ), '', array( 'response' => 403 ) );
+        }
+
+        global $wpdb;
+        $table    = $wpdb->prefix . self::DB_PREFIX . 'sms_log';
+        $per_page = 25;
+        $page     = max( 1, absint( $_GET['paged'] ?? 1 ) );
+        $offset   = ( $page - 1 ) * $per_page;
+
+        // Filters — validated, then used as bound parameters.
+        $f_status = sanitize_key( wp_unslash( $_GET['sms_status'] ?? '' ) );
+        $f_event  = sanitize_key( wp_unslash( $_GET['sms_event'] ?? '' ) );
+        $f_order  = absint( $_GET['sms_order'] ?? 0 );
+
+        $where  = array( '1=1' );
+        $params = array();
+        if ( '' !== $f_status ) { $where[] = 'status = %s';  $params[] = $f_status; }
+        if ( '' !== $f_event )  { $where[] = 'event = %s';   $params[] = $f_event; }
+        if ( $f_order )         { $where[] = 'order_id = %d'; $params[] = $f_order; }
+        $clause = implode( ' AND ', $where );
+
+        $total = (int) $wpdb->get_var( $params
+            ? $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE {$clause}", $params )
+            : "SELECT COUNT(*) FROM {$table} WHERE {$clause}" );
+
+        $sql = "SELECT * FROM {$table} WHERE {$clause} ORDER BY id DESC LIMIT %d OFFSET %d";
+        $logs = $wpdb->get_results( $wpdb->prepare( $sql, array_merge( $params, array( $per_page, $offset ) ) ) );
+        $pages = (int) ceil( $total / $per_page );
+
+        $status_labels = array(
+            'queued'  => array( '⏳', 'warn',  __( 'در صف', 'wc-bank-receipt' ) ),
+            'sending' => array( '📤', 'info',  __( 'در حال ارسال', 'wc-bank-receipt' ) ),
+            'sent'    => array( '✓',  'ok',    __( 'ارسال شد', 'wc-bank-receipt' ) ),
+            'failed'  => array( '✗',  'err',   __( 'ناموفق', 'wc-bank-receipt' ) ),
+            'unknown' => array( '?',  'muted', __( 'نامشخص', 'wc-bank-receipt' ) ),
+        );
+        ?>
+        <div class="wcr-wrap">
+            <div class="wcr-header">
+                <span class="dashicons dashicons-email-alt"></span>
+                <h1><?php _e( 'تاریخچه پیامک‌ها', 'wc-bank-receipt' ); ?></h1>
+            </div>
+
+            <div class="wcr-card">
+                <form method="get">
+                    <input type="hidden" name="page" value="wc-sms-log">
+                    <table class="wcr-ftbl">
+                        <tr>
+                            <th><?php _e( 'وضعیت', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <select name="sms_status">
+                                    <option value=""><?php _e( 'همه', 'wc-bank-receipt' ); ?></option>
+                                    <?php foreach ( $status_labels as $slug => $meta ) : ?>
+                                        <option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $f_status, $slug ); ?>><?php echo esc_html( $meta[2] ); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'رویداد', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <select name="sms_event">
+                                    <option value=""><?php _e( 'همه', 'wc-bank-receipt' ); ?></option>
+                                    <?php foreach ( $this->sms_events() as $slug => $spec ) : ?>
+                                        <option value="<?php echo esc_attr( $slug ); ?>" <?php selected( $f_event, $slug ); ?>><?php echo esc_html( $spec['label'] ); ?></option>
+                                    <?php endforeach; ?>
+                                    <option value="test" <?php selected( $f_event, 'test' ); ?>><?php _e( 'پیام آزمایشی', 'wc-bank-receipt' ); ?></option>
+                                </select>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e( 'شماره سفارش', 'wc-bank-receipt' ); ?></th>
+                            <td>
+                                <input type="number" name="sms_order" min="1" style="max-width:140px;" value="<?php echo $f_order ? esc_attr( $f_order ) : ''; ?>">
+                                <button type="submit" class="button"><?php _e( 'فیلتر', 'wc-bank-receipt' ); ?></button>
+                            </td>
+                        </tr>
+                    </table>
+                </form>
+            </div>
+
+            <div class="wcr-card">
+                <table class="wcr-tbl">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th><?php _e( 'سفارش', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'رویداد', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'گیرنده', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'متن', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'وضعیت', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'تلاش', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'پاسخ', 'wc-bank-receipt' ); ?></th>
+                            <th><?php _e( 'زمان', 'wc-bank-receipt' ); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php if ( $logs ) : foreach ( $logs as $l ) :
+                        $status = (string) $l->status;
+                        $meta   = isset( $status_labels[ $status ] ) ? $status_labels[ $status ] : $status_labels['unknown'];
+                        $event_label = isset( $this->sms_events()[ $l->event ] ) ? $this->sms_events()[ $l->event ]['label'] : $l->event;
+                        if ( 'test' === $l->event ) $event_label = __( 'پیام آزمایشی', 'wc-bank-receipt' );
+                    ?>
+                        <tr>
+                            <td><?php echo (int) $l->id; ?></td>
+                            <td>
+                                <?php
+                                // HPOS-aware link: get_edit_post_link() returns nothing for an
+                                // order stored in the orders table, so WooCommerce's own
+                                // accessor is asked instead.
+                                $log_order = $l->order_id ? wc_get_order( (int) $l->order_id ) : false;
+                                if ( $log_order ) :
+                                    ?>
+                                    <a href="<?php echo esc_url( (string) $log_order->get_edit_order_url() ); ?>">#<?php echo (int) $l->order_id; ?></a>
+                                <?php elseif ( $l->order_id ) : ?>
+                                    #<?php echo (int) $l->order_id; ?>
+                                <?php else : ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo esc_html( $event_label ); ?></td>
+                            <td dir="ltr"><?php echo esc_html( $l->recipient ); ?></td>
+                            <td title="<?php echo esc_attr( (string) $l->message ); ?>">
+                                <?php echo esc_html( (string) mb_strimwidth( (string) $l->message, 0, 55, '…' ) ); ?>
+                            </td>
+                            <td><span class="wcr-badge <?php echo esc_attr( $meta[1] ); ?>"><?php echo esc_html( $meta[0] . ' ' . $meta[2] ); ?></span></td>
+                            <td><?php echo (int) $l->attempts; ?></td>
+                            <td style="max-width:280px;word-break:break-word;font-size:12px;color:#607d8b;">
+                                <?php
+                                echo esc_html( (string) mb_strimwidth( (string) $l->response, 0, 90, '…' ) );
+                                if ( ! empty( $l->http_code ) ) echo ' <span class="wcr-hint">HTTP ' . (int) $l->http_code . '</span>';
+                                if ( ! empty( $l->provider_id ) ) echo ' <span class="wcr-hint">ID ' . esc_html( (string) $l->provider_id ) . '</span>';
+                                if ( ! empty( $l->next_attempt ) ) echo ' <span class="wcr-hint">' . esc_html( sprintf( __( 'تلاش بعدی: %s', 'wc-bank-receipt' ), $l->next_attempt ) ) . '</span>';
+                                ?>
+                            </td>
+                            <td><?php echo esc_html( (string) ( $l->created_at ? $l->created_at : $l->timestamp ) ); ?></td>
+                        </tr>
+                    <?php endforeach; else : ?>
+                        <tr><td colspan="9" style="text-align:center;padding:30px;color:#90a4ae;"><?php _e( 'رکوردی با این فیلتر وجود ندارد.', 'wc-bank-receipt' ); ?></td></tr>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+                <?php if ( $pages > 1 ) : ?>
+                    <div class="tablenav" style="margin-top:16px;"><div class="tablenav-pages">
+                        <?php
+                        echo paginate_links( array(
+                            'base'      => add_query_arg( 'paged', '%#%' ),
+                            'format'    => '',
+                            'prev_text' => '&laquo;',
+                            'next_text' => '&raquo;',
+                            'total'     => $pages,
+                            'current'   => $page,
+                        ) );
+                        ?>
+                    </div></div>
+                <?php endif; ?>
+                <p class="wcr-hint"><?php printf( esc_html__( 'مجموع: %d رکورد', 'wc-bank-receipt' ), $total ); ?></p>
+            </div>
+        </div>
         <?php
     }
 
@@ -3826,6 +5060,136 @@ class WC_Bank_Receipt_Pro {
         return count( $order->get_items() );
     }
 
+    // =========================================================================
+    // EVENT ORIGIN (who caused this status change?)
+    // =========================================================================
+
+    /**
+     * Enter an explicit origin context. Always paired with origin_end().
+     *
+     * @param string $origin One of the ORIGIN_* constants.
+     */
+    private function origin_begin( $origin ) {
+        self::$origin_stack[] = (string) $origin;
+    }
+
+    /** Leave the current origin context (never below an empty stack). */
+    private function origin_end() {
+        array_pop( self::$origin_stack );
+    }
+
+    /**
+     * Run a callable with an origin context and restore the previous one afterwards.
+     *
+     * try/finally, not a “set then clear at the end”: when an internal operation throws
+     * (or returns through a nested call), the context has to be released anyway. A leaked
+     * context would silently classify later events as plugin-internal and hide them.
+     *
+     * @param string   $origin
+     * @param callable $fn
+     * @return mixed Whatever $fn returns.
+     */
+    private function with_origin( $origin, $fn ) {
+        $this->origin_begin( $origin );
+        try {
+            return $fn();
+        } finally {
+            $this->origin_end();
+        }
+    }
+
+    /** The origin explicitly set by surrounding plugin code, or '' when none is active. */
+    private static function origin_context() {
+        return self::$origin_stack ? (string) end( self::$origin_stack ) : '';
+    }
+
+    /**
+     * Is this request a shop manager driving wp-admin or the REST API?
+     *
+     * Two request facts are required together — a signed-in user who may manage the shop
+     * AND an administrative request context. A manager simply browsing the storefront
+     * (placing a test order like a customer) is therefore not treated as an admin action,
+     * and a guest REST call is not either.
+     */
+    private function request_is_manager_driven() {
+        if ( ! is_user_logged_in() || ! current_user_can( self::CAP_MANAGE ) ) return false;
+        if ( is_admin() ) return true;                                   // wp-admin + admin-ajax.php + order editor
+        if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) return true;     // admin REST / Store API with a capable user
+        return false;
+    }
+
+    /**
+     * Decide who caused an order event.
+     *
+     * @param WC_Order $order
+     * @param string   $hint Explicit origin from the caller (wins over detection).
+     * @return string One of the ORIGIN_* constants.
+     */
+    private function classify_event_origin( $order, $hint = '' ) {
+        if ( '' !== $hint ) {
+            return (string) apply_filters( 'wcr_event_origin', $hint, $order, 'hint' );
+        }
+        $context = self::origin_context();
+        if ( '' !== $context ) {
+            return (string) apply_filters( 'wcr_event_origin', $context, $order, 'context' );
+        }
+
+        $origin = self::ORIGIN_UNKNOWN;
+
+        // 1) Unattended execution: no user is behind a cron job or a WP-CLI command,
+        //    whatever the surrounding request happens to look like.
+        if ( ( function_exists( 'wp_doing_cron' ) && wp_doing_cron() )
+             || ( defined( 'WP_CLI' ) && WP_CLI )
+             || ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() && ! is_user_logged_in() && ! $this->request_is_manager_driven() && $this->ajax_action_is_system() ) ) {
+            $origin = self::ORIGIN_SYSTEM;
+        } elseif ( $this->request_is_manager_driven() ) {
+            // 2) A manager acting from wp-admin / REST.
+            $origin = self::ORIGIN_ADMIN_MANUAL;
+        } else {
+            // 3) Customer-side flows, identified by how the order was created.
+            $via = ( $order instanceof WC_Order && method_exists( $order, 'get_created_via' ) )
+                ? (string) $order->get_created_via()
+                : '';
+            if ( in_array( $via, array( 'checkout', 'store-api' ), true ) ) {
+                $origin = self::ORIGIN_CUSTOMER_CHECKOUT;
+            } elseif ( 'rest-api' === $via && ! is_user_logged_in() ) {
+                // A gateway or an integration created it: unattended by definition.
+                $origin = self::ORIGIN_PAYMENT_GATEWAY;
+            }
+        }
+
+        return (string) apply_filters( 'wcr_event_origin', $origin, $order, 'detected' );
+    }
+
+    /**
+     * A front-end/admin-ajax request with no session, running an action the plugin itself
+     * scheduled (WooCommerce's own async actions look like this).
+     */
+    private function ajax_action_is_system() {
+        $action = isset( $_REQUEST['action'] ) ? sanitize_key( wp_unslash( $_REQUEST['action'] ) ) : '';
+        if ( '' === $action ) return false;
+        foreach ( array( 'wc_', 'woocommerce_', 'wcr_', 'as_' ) as $prefix ) {
+            if ( 0 === strpos( $action, $prefix ) ) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Origins whose dashboard popup and sound are suppressed.
+     *
+     * Deliberately a small, explicit list: the manager who just clicked “approve” does not
+     * need a popup about their own click. The alert *row* is still written (with
+     * suppressed = 1) so the trail is complete and an unexpected origin stays diagnosable.
+     */
+    private function origin_is_suppressed( $origin ) {
+        $suppressed = in_array(
+            (string) $origin,
+            array( self::ORIGIN_ADMIN_MANUAL, self::ORIGIN_ADMIN_REVIEW, self::ORIGIN_PLUGIN_INTERNAL ),
+            true
+        );
+        return (bool) apply_filters( 'wcr_suppress_admin_alert', $suppressed, $origin );
+    }
+
     /**
      * Append one event to the queue.
      *
@@ -3833,9 +5197,20 @@ class WC_Bank_Receipt_Pro {
      * value that is genuinely unknown is stored empty instead of being guessed. The
      * UNIQUE dedupe key makes the insert itself the duplicate check, so two concurrent
      * requests cannot both queue the same event.
+     *
+     * @param string   $event_type new_order | status_change
+     * @param WC_Order $order
+     * @param string   $from_status
+     * @param string   $to_status
+     * @param string   $origin  One of the ORIGIN_* constants; '' → classified here.
      */
-    private function record_alert_event( $event_type, $order, $from_status = '', $to_status = '' ) {
+    private function record_alert_event( $event_type, $order, $from_status = '', $to_status = '', $origin = '' ) {
         if ( ! ( $order instanceof WC_Order ) ) return 0;
+
+        if ( '' === $origin ) {
+            $origin = $this->classify_event_origin( $order );
+        }
+        $suppressed = $this->origin_is_suppressed( $origin ) ? 1 : 0;
 
         global $wpdb;
         $table = $wpdb->prefix . self::DB_PREFIX . 'events';
@@ -3849,6 +5224,12 @@ class WC_Bank_Receipt_Pro {
         // and is kept as its own event.
         $window     = (int) floor( time() / self::ALERT_DEDUPE_WINDOW );
         $dedupe_key = md5( $event_type . '|' . $order_id . '|' . $from_status . '|' . $to_status . '|' . $window );
+
+        // One line in the debug log for every event the plugin could not attribute: enough
+        // to diagnose a surprising origin on a real shop, without a second data store.
+        if ( self::ORIGIN_UNKNOWN === $origin && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            error_log( sprintf( '[wc-bank-receipt] unclassified event origin: %s order #%d', $event_type, $order_id ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+        }
 
         $suppress = $wpdb->suppress_errors( true );
         $inserted = $wpdb->insert(
@@ -3867,6 +5248,8 @@ class WC_Bank_Receipt_Pro {
                 'user_id'       => get_current_user_id(),
                 'created_at'    => current_time( 'mysql' ),
                 'created_gmt'   => gmdate( 'Y-m-d H:i:s' ),
+                'origin'        => (string) $origin,
+                'suppressed'    => $suppressed,
                 'dedupe_key'    => $dedupe_key,
             )
         );
@@ -3975,6 +5358,10 @@ class WC_Bank_Receipt_Pro {
      * `woocommerce_order_status_changed` — the one standard flow every status change goes
      * through: orders list, order editor, REST API, payment gateways and this plugin's own
      * approve/reject actions. Deliberately not limited to card-to-card orders.
+     *
+     * The actor is resolved before queueing: a status change a manager made by hand (or
+     * that this plugin made on a manager's behalf) is stored as a suppressed event, so the
+     * trail is complete but the manager is not alerted about their own click.
      */
     public function record_status_change_event( $order_id, $from_status, $to_status, $order = null ) {
         $order_id = (int) $order_id;
@@ -3992,7 +5379,13 @@ class WC_Bank_Receipt_Pro {
         }
         if ( self::normalize_status( $from_status ) === self::normalize_status( $to_status ) ) return;
 
-        $this->record_alert_event( 'status_change', $order, $from_status, $to_status );
+        $this->record_alert_event(
+            'status_change',
+            $order,
+            $from_status,
+            $to_status,
+            $this->classify_event_origin( $order )
+        );
     }
 
     /**
@@ -4105,7 +5498,7 @@ class WC_Bank_Receipt_Pro {
         }
 
         $rows = $wpdb->get_results( $wpdb->prepare(
-            "SELECT * FROM {$table} WHERE id > %d ORDER BY id ASC LIMIT %d",
+            "SELECT * FROM {$table} WHERE id > %d AND suppressed = 0 ORDER BY id ASC LIMIT %d",
             $cursor,
             self::ALERT_BATCH_MAX
         ) );
@@ -4121,7 +5514,7 @@ class WC_Bank_Receipt_Pro {
         $has_more = false;
         if ( $events ) {
             $has_more = (bool) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$table} WHERE id > %d",
+                "SELECT COUNT(*) FROM {$table} WHERE id > %d AND suppressed = 0",
                 $last_id
             ) );
         }
@@ -4184,6 +5577,13 @@ class WC_Bank_Receipt_Pro {
             'interval' => max( 3000, (int) apply_filters( 'wc_receipt_alert_poll_interval', 10000 ) ),
             'drain'    => 700,
             'cooldown' => max( 1000, (int) apply_filters( 'wc_receipt_alert_sound_cooldown', 4000 ) ),
+            // How often the alarm repeats while an event is still unacknowledged. Bounded
+            // on both sides: a 1-second siren is unusable, a 10-minute silence is not an alarm.
+            'repeat'   => max( 3, min( 300, (int) apply_filters( 'wc_receipt_alert_repeat_seconds',
+                            absint( get_option( 'wc_receipt_alerts_repeat', 12 ) ) ?: 12 ) ) ) * 1000,
+            // A tab keeps the “I am the one beeping” lock for this long; a closed or frozen
+            // tab therefore hands the alarm over instead of muting it forever.
+            'leaderTtl' => max( 3000, min( 60000, (int) apply_filters( 'wc_receipt_alert_leader_ttl', 12000 ) ) ),
             'sound'    => $this->alert_sound_enabled(),
             'labels'   => array(
                 'title'        => __( 'اعلان سفارش', 'wc-bank-receipt' ),
@@ -4195,6 +5595,7 @@ class WC_Bank_Receipt_Pro {
                 'status'       => __( 'وضعیت فعلی سفارش', 'wc-bank-receipt' ),
                 'orderState'   => __( 'وضعیت سفارش', 'wc-bank-receipt' ),
                 'transition'   => __( 'تغییر وضعیت', 'wc-bank-receipt' ),
+                'toArrow'      => __( 'به', 'wc-bank-receipt' ),
                 'event'        => __( 'نوع رویداد', 'wc-bank-receipt' ),
                 'time'         => __( 'تاریخ و ساعت رویداد', 'wc-bank-receipt' ),
                 'unknown'      => __( 'نامشخص', 'wc-bank-receipt' ),
@@ -4204,6 +5605,12 @@ class WC_Bank_Receipt_Pro {
                 'remaining'    => __( 'رویداد دیگر در صف', 'wc-bank-receipt' ),
                 'orderGone'    => __( 'حذف‌شده — اطلاعات از لحظه رویداد', 'wc-bank-receipt' ),
                 'soundOn'      => __( 'فعال‌سازی صدا', 'wc-bank-receipt' ),
+                'soundTest'    => __( 'آزمایش صدا', 'wc-bank-receipt' ),
+                'soundTested'  => __( 'صدا پخش شد.', 'wc-bank-receipt' ),
+                'soundOff'     => __( 'صدا در تنظیمات خاموش است.', 'wc-bank-receipt' ),
+                'soundUnsupported' => __( 'مرورگر شما از پخش صدا پشتیبانی نمی‌کند.', 'wc-bank-receipt' ),
+                'repeatHint'   => __( 'این هشدار تا زمانی که اعلان را نبندید تکرار می‌شود.', 'wc-bank-receipt' ),
+                'dismissAll'   => __( 'رسیدگی به همه', 'wc-bank-receipt' ),
                 'soundBlocked' => __( 'مرورگر پخش خودکار صدا را مسدود کرده است. برای فعال‌سازی صدای هشدار کلیک کنید.', 'wc-bank-receipt' ),
                 'noAudio'      => __( 'مرورگر شما از پخش صدا پشتیبانی نمی‌کند؛ اعلان تصویری نمایش داده می‌شود.', 'wc-bank-receipt' ),
             ),
@@ -4225,13 +5632,24 @@ class WC_Bank_Receipt_Pro {
         #wcr-alert-modal dl{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0;padding:4px 22px 8px;font-size:14px;}
         #wcr-alert-modal dt{color:#64748b;margin:0;}
         #wcr-alert-modal dd{margin:0;color:#0f172a;font-weight:600;word-break:break-word;}
-        #wcr-alert-modal dd.wcr-alert-transition{color:#e65100;}
+        /*
+         * The transition line is LTR and isolated *on purpose*.
+         * The popup is RTL, and the arrow (U+2192, a bidi-neutral character) inside an RTL
+         * run would be laid out right-to-left: the “old” label would sit on the RIGHT and
+         * the arrow would appear to point from the new status back to the old one. Isolating
+         * the value with an explicit LTR base direction makes the sequence read
+         * “old → new” in both a Persian and an English admin, regardless of the theme.
+         */
+        #wcr-alert-modal dd.wcr-alert-transition{color:#e65100;direction:ltr;unicode-bidi:isolate;text-align:left;}
+        #wcr-alert-modal dd.wcr-alert-transition .wcr-alert-tr{display:inline;white-space:nowrap;}
+        #wcr-alert-modal dd.wcr-alert-transition .wcr-alert-arrow{padding:0 6px;font-weight:700;}
         #wcr-alert-modal .wcr-alert-queue{margin:10px 22px 0;padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:13px;color:#475569;}
         #wcr-alert-modal .wcr-alert-queue b{color:#0f172a;}
         #wcr-alert-modal .wcr-alert-queue ul{margin:6px 0 0;padding-inline-start:18px;}
         #wcr-alert-modal .wcr-alert-queue button{background:none;border:none;padding:0;color:#1565c0;cursor:pointer;font:inherit;text-align:start;}
         #wcr-alert-modal .wcr-alert-blocked{margin:10px 22px 0;padding:10px 12px;background:#fff8e1;border:1px solid #ffe082;border-radius:10px;font-size:13px;color:#8d6e00;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
-        #wcr-alert-modal .wcr-alert-actions{display:flex;gap:10px;justify-content:flex-end;padding:16px 22px 20px;flex-wrap:wrap;}
+        #wcr-alert-modal .wcr-alert-actions{display:flex;gap:10px;justify-content:flex-end;padding:16px 22px 12px;flex-wrap:wrap;}
+        #wcr-alert-modal .wcr-alert-repeat{margin:0;padding:0 22px 18px;font-size:12px;color:#64748b;}
         #wcr-alert-modal .wcr-alert-btn{font:inherit;font-weight:600;font-size:14px;padding:10px 16px;border-radius:9px;cursor:pointer;text-decoration:none;border:1px solid transparent;display:inline-block;line-height:1.4;}
         #wcr-alert-modal .wcr-alert-primary{background:#1565c0;color:#fff;}
         #wcr-alert-modal .wcr-alert-primary:hover{background:#0d47a1;color:#fff;}
@@ -4260,8 +5678,10 @@ class WC_Bank_Receipt_Pro {
                 <div class="wcr-alert-actions">
                     <a class="wcr-alert-btn wcr-alert-primary" id="wcr-alert-view" href="#"
                        target="_blank" rel="noopener noreferrer" hidden><?php echo esc_html( $cfg['labels']['view'] ); ?></a>
+                    <button type="button" class="wcr-alert-ghost" id="wcr-alert-dismiss-all" hidden></button>
                     <button type="button" class="wcr-alert-ghost" id="wcr-alert-close"></button>
                 </div>
+                <p class="wcr-alert-repeat" id="wcr-alert-repeat" hidden></p>
             </div>
         </div>
 
@@ -4283,6 +5703,8 @@ class WC_Bank_Receipt_Pro {
             var soundBtn   = document.getElementById('wcr-alert-sound');
             var blockedBox = document.getElementById('wcr-alert-blocked');
             var blockedMsg = document.getElementById('wcr-alert-blocked-msg');
+            var dismissAll = document.getElementById('wcr-alert-dismiss-all');
+            var repeatNote = document.getElementById('wcr-alert-repeat');
 
             var queue    = [];   // delivered events, oldest first
             var cursor   = 0;    // highest id acknowledged for this user
@@ -4294,6 +5716,40 @@ class WC_Bank_Receipt_Pro {
             var lastBeep = 0;
             var audio    = null;
             var soundOn  = !!cfg.sound;
+            var soundTimer = null;   // the single repeating-alarm interval, or null
+            var soundOwner = '';     // this page's tab id, for the cross-tab lock
+
+            /*
+             * Events this browser already dismissed.
+             *
+             * The server cursor is the authority, but it is advanced by a *request*: if
+             * that request is lost, a reload would deliver the same event again and — with
+             * a repeating alarm — sound it again. Remembering the ids locally closes that
+             * gap, and the list is bounded so it can never grow without limit.
+             */
+            var ACK_KEY = 'wcrAlertAcked';
+            var acked = {};
+            (function () {
+                try {
+                    var raw = window.localStorage ? window.localStorage.getItem(ACK_KEY) : null;
+                    var ids = raw ? JSON.parse(raw) : [];
+                    if (ids && ids.length) ids.slice(-200).forEach(function (id) { acked[id] = 1; });
+                } catch (e) { acked = {}; }
+            })();
+
+            function storeAck() {
+                try {
+                    if (!window.localStorage) return;
+                    var ids = Object.keys(acked).slice(-200);
+                    window.localStorage.setItem(ACK_KEY, JSON.stringify(ids));
+                } catch (e) { /* private mode, quota: the server cursor still applies */ }
+            }
+
+            function markAcked(id) {
+                if (!id) return;
+                acked[id] = 1;
+                storeAck();
+            }
 
             /* ---------------------------------------------------------------- *
              * Transport
@@ -4346,13 +5802,17 @@ class WC_Bank_Receipt_Pro {
 
                     var fresh = [];
                     (data.events || []).forEach(function (e) {
-                        if (!seen[e.id]) { seen[e.id] = true; fresh.push(e); }
+                        // Already handled in this browser (this load or a previous one): an
+                        // acknowledged event must never come back with its alarm.
+                        if (seen[e.id] || acked[e.id]) return;
+                        seen[e.id] = true;
+                        fresh.push(e);
                     });
 
                     if (fresh.length) {
                         queue = queue.concat(fresh);
                         render();
-                        play(false);
+                        play(true);   // sound the new event now, then keep repeating
                     }
                     if (typeof data.cursor === 'number' && data.cursor > cursor) {
                         cursor = data.cursor;
@@ -4404,14 +5864,26 @@ class WC_Bank_Receipt_Pro {
                 });
             }
 
-            function play(force) {
+            /**
+             * The alarm beep.
+             *
+             * @param {boolean} force  Ignore the burst cooldown (a genuinely new event).
+             * @param {boolean} manual A human pressed “test sound” or “activate sound”:
+             *                         their explicit request is never blocked by the cross-tab
+             *                         lock, which only exists to silence *automatic* alarms.
+             */
+            function play(force, manual) {
                 if (!soundOn) return false;
                 var now = Date.now();
                 // Burst control: a wave of status changes beeps once, not once per event.
                 if (!force && lastBeep && (now - lastBeep) < cfg.cooldown) return false;
+                // One tab sounds the alarm: several dashboard tabs of the same manager must
+                // not turn one order into a chorus. The lock is claimed here (not per
+                // interval) so a frozen tab hands over instead of silencing the shop.
+                if (!manual && !soundLeader()) return false;
 
                 var ctx = audioContext();
-                if (!ctx) { showBlocked(L.noAudio); return false; }
+                if (!ctx) { showBlocked(L.soundUnsupported || L.noAudio); return false; }
 
                 var running = false;
                 try {
@@ -4431,6 +5903,45 @@ class WC_Bank_Receipt_Pro {
                 }
             }
 
+            /** This tab's identity, for the cross-tab alarm lock. */
+            function tabId() {
+                if (soundOwner) return soundOwner;
+                soundOwner = String(Date.now()) + '-' + String(Math.random()).slice(2, 8);
+                return soundOwner;
+            }
+
+            /**
+             * Claim (or keep) the right to beep. Returns false while another tab owns it.
+             *
+             * Deliberately best-effort: with localStorage unavailable every tab simply
+             * sounds its own alarm — a beep too many is better than a silent shop.
+             */
+            function soundLeader() {
+                try {
+                    if (!window.localStorage) return true;
+                    var owner = window.localStorage.getItem('wcrAlertSoundOwner') || '';
+                    var stamp = parseInt(window.localStorage.getItem('wcrAlertSoundAt') || '0', 10) || 0;
+                    var now = Date.now();
+                    if (owner === tabId() || !owner || (now - stamp) > cfg.leaderTtl) {
+                        window.localStorage.setItem('wcrAlertSoundOwner', tabId());
+                        window.localStorage.setItem('wcrAlertSoundAt', String(now));
+                        return true;
+                    }
+                    return false;
+                } catch (e) { return true; }
+            }
+
+            /** The single alarm interval: repeats until the queue is empty or sound is off. */
+            function ensureSound() {
+                if (!soundOn || !queue.length) { stopSound(); return; }
+                if (soundTimer) return;
+                soundTimer = window.setInterval(function () { play(false); }, cfg.repeat);
+            }
+
+            function stopSound() {
+                if (soundTimer) { window.clearInterval(soundTimer); soundTimer = null; }
+            }
+
             /* ---------------------------------------------------------------- *
              * Rendering — every value goes in as text, never as HTML.
              * ---------------------------------------------------------------- */
@@ -4442,6 +5953,49 @@ class WC_Bank_Receipt_Pro {
                     ? L.unknown
                     : String(value);
                 if (className) dd.className = className;
+                factsBox.appendChild(dt);
+                factsBox.appendChild(dd);
+            }
+
+            /*
+             * The status transition: “old → new”, as three explicit nodes.
+             *
+             * The direction is carried by the markup (each label in its own nowrap span,
+             * the arrow a separate node between them, the whole value in an LTR isolated
+             * container) rather than inferred from the page layout — so a right-to-left
+             * admin, a left-to-right one, or any future CSS change cannot silently flip it.
+             * Labels stay RTL-content-safe because each is its own run.
+             */
+            function factTransition(e) {
+                var dt = document.createElement('dt');
+                dt.textContent = L.transition;
+
+                var dd = document.createElement('dd');
+                dd.className = 'wcr-alert-transition';
+
+                var from = document.createElement('span');
+                from.className = 'wcr-alert-tr';
+                var fromLabel = e.from_status_label || L.unknown;
+                from.textContent = fromLabel;
+
+                var arrow = document.createElement('span');
+                arrow.className = 'wcr-alert-arrow';
+                arrow.textContent = '\u2192'; // →, never a CSS-generated glyph
+                arrow.setAttribute('aria-hidden', 'true');
+
+                var to = document.createElement('span');
+                to.className = 'wcr-alert-tr';
+                var toLabel = e.to_status_label || L.unknown;
+                to.textContent = toLabel;
+
+                dd.appendChild(from);
+                dd.appendChild(arrow);
+                dd.appendChild(to);
+
+                // Screen readers get the meaning, not the glyph: “from X to Y”.
+                dd.setAttribute('role', 'text');
+                dd.setAttribute('aria-label', L.transition + ': ' + fromLabel + ' ' + L.toArrow + ' ' + toLabel);
+
                 factsBox.appendChild(dt);
                 factsBox.appendChild(dd);
             }
@@ -4470,9 +6024,7 @@ class WC_Bank_Receipt_Pro {
                     fact(L.orderState, L.orderGone);
                 }
                 if (e.type === 'status_change') {
-                    fact(L.transition,
-                        (e.from_status_label || L.unknown) + ' → ' + (e.to_status_label || L.unknown),
-                        'wcr-alert-transition');
+                    factTransition(e);
                 }
                 fact(L.event, e.type_label);
                 fact(L.time, e.time_display);
@@ -4511,36 +6063,55 @@ class WC_Bank_Receipt_Pro {
                     });
                     queueBox.appendChild(ul);
                     queueBox.hidden = false;
-                    closeBtn.textContent = L.closeAll;
                 } else {
                     queueBox.hidden = true;
-                    closeBtn.textContent = L.close;
                 }
+
+                // Closing is always per event; “dismiss everything” is its own explicit
+                // button. Handling one alert must never silence the ones still waiting.
+                closeBtn.textContent = L.close;
+                dismissAll.hidden = (queue.length < 2);
+                if (!dismissAll.hidden) dismissAll.textContent = L.dismissAll + ' (' + queue.length + ')';
+
+                repeatNote.textContent = (soundOn && queue.length) ? L.repeatHint : '';
+                repeatNote.hidden = !(soundOn && queue.length);
 
                 overlay.classList.add('wcr-active');
                 overlay.setAttribute('aria-hidden', 'false');
+
+                // One place decides whether the alarm runs: it repeats while an event is on
+                // screen and stops the instant the queue is empty.
+                ensureSound();
             }
 
             function closeCurrent() {
                 if (!queue.length) return;
+                markAcked(queue[0].id);   // handled by this browser → never alarmed again
                 queue.shift();
                 render();
             }
 
-            closeBtn.addEventListener('click', function () {
-                // The label is “close” for a single card and “close all” while more
-                // events wait, so the button has to honour it: clear the whole queue.
-                // Closing one card at a time stays available with the Escape key.
-                if (queue.length > 1) {
-                    queue = [];
-                    render();
-                } else {
-                    closeCurrent();
+            function closeAll() {
+                while (queue.length) {
+                    markAcked(queue[0].id);
+                    queue.shift();
                 }
-            });
+                render();
+                ack();
+            }
+
+            closeBtn.addEventListener('click', closeCurrent);
+            dismissAll.addEventListener('click', closeAll);
             soundBtn.addEventListener('click', function () {
                 // A real click is the user gesture an autoplay-blocked browser waits for.
-                play(true);
+                play(true, true);
+                ensureSound();
+            });
+            viewBtn.addEventListener('click', function () {
+                // Opening the order counts as handling this alert: record it first, then let
+                // the browser follow the link (it opens in a new tab, so this page stays).
+                closeCurrent();
+                ack();
             });
             document.addEventListener('keydown', function (ev) {
                 if (ev.key === 'Escape' && overlay.classList.contains('wcr-active')) closeCurrent();
@@ -4557,6 +6128,33 @@ class WC_Bank_Receipt_Pro {
                     if (ctx && ctx.state === 'running' && !blockedBox.hidden) blockedBox.hidden = true;
                 }, { once: true });
             });
+            // Leaving the page must not leave a timer behind (a bfcache restore would
+            // otherwise run a second interval next to the restored one).
+            window.addEventListener('pagehide', stopSound);
+
+            /*
+             * A tiny, documented surface for the settings screen: the “آزمایش صدا” button
+             * plays exactly the alarm the popup uses instead of a second, drifting copy of
+             * the oscillator code. Data only — no behaviour is injected from outside.
+             */
+            window.WCR_ALERT_SOUND = {
+                test: function () {
+                    if (!soundOn) return 'off';
+                    return play(true, true) ? 'played' : 'blocked';
+                },
+                unlock: function () {
+                    var ctx = audioContext();
+                    if (!ctx) return 'unsupported';
+                    var running = false;
+                    try {
+                        if (ctx.state === 'suspended') ctx.resume();
+                        running = (ctx.state === 'running');
+                    } catch (e) { running = false; }
+                    return running ? 'ready' : 'blocked';
+                },
+                enabled: function () { return soundOn; },
+                label: function (key) { return L[key] || ''; }
+            };
 
             schedule(1500);
         })();
@@ -4620,7 +6218,35 @@ class WC_Bank_Receipt_Pro {
                     <?php esc_html_e( 'این نمونهٔ زنده با داده‌های نمایشی ساخته می‌شود و به هیچ سفارش، کارت یا اطلاعات مشتری وابسته نیست.', 'wc-bank-receipt' ); ?>
                     <span class="wcr-badge info" data-wcr-appearance-state><?php esc_html_e( 'بر اساس تنظیمات ذخیره‌شده', 'wc-bank-receipt' ); ?></span>
                 </p>
-                <?php echo $this->appearance_preview_html(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
+                <div class="wcr-el-editor">
+                    <div class="wcr-el-stage">
+                        <?php echo $this->appearance_preview_html(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
+                    </div>
+                    <?php
+                    /*
+                     * The element panel.
+                     *
+                     * The markup is empty on purpose: the panel is built by the script from
+                     * the element→token map ($this->appearance_element_map()), and every control
+                     * in it is a proxy for the *real* field further down this page. There is
+                     * exactly one place a value is stored (the form) and exactly one place it
+                     * is resolved (the server), so an element click can never invent a second
+                     * source of truth for the same token.
+                     */
+                    ?>
+                    <aside class="wcr-el-panel" data-wcr-el-panel aria-live="polite">
+                        <h3 class="wcr-el-panel-title"><?php esc_html_e( 'ویرایشگر عناصر', 'wc-bank-receipt' ); ?></h3>
+                        <p class="wcr-el-empty" data-wcr-el-empty><?php esc_html_e( 'روی یکی از اجزای پیش‌نمایش کلیک کنید تا تنظیمات همان عنصر اینجا باز شود.', 'wc-bank-receipt' ); ?></p>
+                        <div class="wcr-el-body" data-wcr-el-body hidden>
+                            <p class="wcr-el-name" data-wcr-el-name></p>
+                            <div class="wcr-el-rows" data-wcr-el-rows></div>
+                            <p class="wcr-el-actions">
+                                <button type="button" class="wcr-btn wcr-btn-ghost" data-wcr-el-reset><?php esc_html_e( 'بازگرداندن این عنصر به خودکار', 'wc-bank-receipt' ); ?></button>
+                            </p>
+                            <p class="wcr-hint"><?php esc_html_e( 'این کنترل‌ها همان فیلدهای فرم پایین صفحه را تغییر می‌دهند؛ برای دائمی‌شدن، «ذخیره ظاهر» را بزنید.', 'wc-bank-receipt' ); ?></p>
+                        </div>
+                    </aside>
+                </div>
             </div>
 
             <form method="post" action="options.php">
@@ -4891,25 +6517,88 @@ class WC_Bank_Receipt_Pro {
 
         ob_start();
         ?>
-        <div class="wcrf-panel" dir="rtl" data-wcr-appearance-preview<?php echo ( '' !== $decl ) ? ' style="' . esc_attr( $decl ) . '"' : ''; ?>>
-            <?php echo $this->bank_card_markup( $card ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
-            <div class="wcrf-timer-box" data-wcr-timer data-remaining="6300" data-total="7200">
+        <div class="wcrf-panel" dir="rtl" data-wcr-appearance-preview data-wcr-el="form"<?php echo ( '' !== $decl ) ? ' style="' . esc_attr( $decl ) . '"' : ''; ?>>
+            <?php echo $this->bank_card_markup( $card, 'card' ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
+            <div class="wcrf-timer-box" data-wcr-timer data-remaining="6300" data-total="7200" data-wcr-el="timer">
                 <div class="wcrf-timer-lbl"><?php esc_html_e( 'فرصت باقی‌مانده:', 'wc-bank-receipt' ); ?></div>
                 <strong class="wcrf-timer-val" aria-live="off">01:45:00</strong>
                 <div class="wcrf-progress"><div class="wcrf-progress-fill" style="width:87%"></div></div>
             </div>
-            <div class="wcrf-status-box pending">
+            <?php /*
+             * The receipt-state box, the “view receipt” trigger and the upload form are the
+             * three elements mission §16 calls out by name (status, view button, file input),
+             * so each carries its own element key here. The keys are inert data: the live
+             * panel does not render them at all.
+             */ ?>
+            <div class="wcrf-status-box pending" data-wcr-el="status">
                 <div class="wcrf-status-title">⏳ <?php esc_html_e( 'در انتظار بررسی مدیریت', 'wc-bank-receipt' ); ?></div>
-                <?php /* A sample link with no target: the preview must not navigate anywhere. */ ?>
-                <span class="wcrf-prev-link"><?php esc_html_e( 'مشاهده فیش ارسالی', 'wc-bank-receipt' ); ?></span>
+                <span class="wcrf-prev-link" data-wcr-el="view-button"><?php esc_html_e( 'مشاهده فیش ارسالی', 'wc-bank-receipt' ); ?></span>
             </div>
-            <div class="wcrf-form">
-                <?php echo $this->drop_zone_markup( $ctx ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
-                <button type="button" class="wcrf-submit-btn">📤 <?php esc_html_e( 'ارسال فیش واریزی', 'wc-bank-receipt' ); ?></button>
+            <div class="wcrf-notice" data-wcr-el="notice"><?php esc_html_e( 'نمونهٔ پیام — این متن فقط در پیش‌نمایش است.', 'wc-bank-receipt' ); ?></div>
+            <div class="wcrf-form" data-wcr-el="upload">
+                <?php echo $this->drop_zone_markup( $ctx, 'dropzone' ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside. ?>
+                <button type="button" class="wcrf-submit-btn" data-wcr-el="button">📤 <?php esc_html_e( 'ارسال فیش واریزی', 'wc-bank-receipt' ); ?></button>
             </div>
         </div>
         <?php
         return (string) ob_get_clean();
+    }
+
+    /**
+     * The element → design-token map behind the interactive editor.
+     *
+     * Which tokens a click on a panel element should offer. Deliberately a *map*, not a
+     * second settings model: the tokens are the same ones the form already edits, and the
+     * canvas the same preview — this only answers “which knobs belong to the thing the
+     * manager just clicked?”.
+     *
+     * The keys are the `data-wcr-el` values the preview renders.
+     *
+     * @return array
+     */
+    private function appearance_element_map() {
+        return array(
+            'card' => array(
+                'label'  => __( 'کارت بانکی', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-card-bg', '--wcrf-card-bg-2', '--wcrf-card-text', '--wcrf-radius-card', '--wcrf-shadow' ),
+            ),
+            'timer' => array(
+                'label'  => __( 'باکس مهلت پرداخت', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-warn-bg', '--wcrf-warn', '--wcrf-radius', '--wcrf-font-size-title', '--wcrf-font-weight-title' ),
+            ),
+            'status' => array(
+                'label'  => __( 'بخش وضعیت رسید', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-surface', '--wcrf-border', '--wcrf-border-width', '--wcrf-radius', '--wcrf-text', '--wcrf-muted', '--wcrf-ok', '--wcrf-ok-bg', '--wcrf-err', '--wcrf-err-bg' ),
+            ),
+            'view-button' => array(
+                'label'  => __( 'دکمه/لینک مشاهده رسید', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-pri', '--wcrf-pri-h', '--wcrf-btn-text', '--wcrf-font-weight' ),
+            ),
+            'notice' => array(
+                'label'  => __( 'پیام‌ها و اخطارها', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-ok', '--wcrf-ok-bg', '--wcrf-warn', '--wcrf-warn-bg', '--wcrf-err', '--wcrf-err-bg', '--wcrf-radius' ),
+            ),
+            'upload' => array(
+                'label'  => __( 'فرم ارسال فیش', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-surface', '--wcrf-pad', '--wcrf-gap', '--wcrf-radius', '--wcrf-font-size' ),
+            ),
+            'dropzone' => array(
+                'label'  => __( 'ورودی فایل و ناحیهٔ رهاکردن', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-field-bg', '--wcrf-field-focus-bg', '--wcrf-border', '--wcrf-border-width', '--wcrf-radius-field', '--wcrf-muted' ),
+            ),
+            'button' => array(
+                'label'  => __( 'دکمهٔ ارسال فیش', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-btn-bg', '--wcrf-btn-bg-2', '--wcrf-btn-bg-h', '--wcrf-btn-text', '--wcrf-radius-button', '--wcrf-font-weight' ),
+            ),
+            'form' => array(
+                'label'  => __( 'کل فرم و تیترها', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-font-family', '--wcrf-font-size-title', '--wcrf-font-weight-title', '--wcrf-text', '--wcrf-line-height', '--wcrf-content-width' ),
+            ),
+            'lightbox' => array(
+                'label'  => __( 'نمایش تمام‌صفحهٔ رسید', 'wc-bank-receipt' ),
+                'tokens' => array( '--wcrf-lb-backdrop', '--wcrf-lb-btn-bg', '--wcrf-lb-btn-fg' ),
+            ),
+        );
     }
 
     /**
@@ -4926,6 +6615,7 @@ class WC_Bank_Receipt_Pro {
         $schema   = WCR_Design_Tokens::schema();
         $tokens   = array();
         $presets  = array();
+        $labels   = array();
 
         foreach ( $schema as $name => $spec ) {
             $entry = array(
@@ -4934,7 +6624,9 @@ class WC_Bank_Receipt_Pro {
                 'ranges'  => isset( $spec['ranges'] ) ? $spec['ranges'] : null,
                 'min'     => isset( $spec['min'] ) ? $spec['min'] : null,
                 'max'     => isset( $spec['max'] ) ? $spec['max'] : null,
+                'label'   => isset( $spec['label'] ) ? $spec['label'] : $name,
             );
+            $labels[ $name ] = $entry['label'];
             if ( 'enum' === $spec['type'] ) {
                 $entry['options'] = array();
                 foreach ( $spec['options'] as $key => $option ) {
@@ -4970,9 +6662,16 @@ class WC_Bank_Receipt_Pro {
             'densities' => $densities,
             'links'     => $links,
             'defaults'  => WCR_Design_Tokens::defaults(),
+            // The element editor: which element owns which tokens, and the human label of
+            // every token, so a click can open the right controls with readable names.
+            'elements'  => $this->appearance_element_map(),
+            'labels'    => $labels,
             'strings'   => array(
-                'saved' => __( 'بر اساس تنظیمات ذخیره‌شده', 'wc-bank-receipt' ),
-                'dirty' => __( 'پیش‌نمایش تغییرات ذخیره‌نشده (تا ذخیره نکنید روی سایت اعمال نمی‌شود)', 'wc-bank-receipt' ),
+                'saved'     => __( 'بر اساس تنظیمات ذخیره‌شده', 'wc-bank-receipt' ),
+                'dirty'     => __( 'پیش‌نمایش تغییرات ذخیره‌نشده (تا ذخیره نکنید روی سایت اعمال نمی‌شود)', 'wc-bank-receipt' ),
+                'automatic' => __( 'خودکار', 'wc-bank-receipt' ),
+                'element'   => __( 'عنصر انتخاب‌شده:', 'wc-bank-receipt' ),
+                'pick'      => __( 'روی یکی از اجزای پیش‌نمایش کلیک کنید تا تنظیمات همان عنصر اینجا باز شود.', 'wc-bank-receipt' ),
             ),
         );
     }

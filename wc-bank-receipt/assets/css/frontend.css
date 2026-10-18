@@ -57,6 +57,13 @@
   --wcrf-card-bg: #1565c0;
   --wcrf-card-bg-2: #42a5f5;
   --wcrf-card-text: #ffffff;
+  /* Colours — full-screen receipt viewer (assets/css/lightbox.css).
+     Declared here as well because this block is the component's canonical default list:
+     the appearance screen offers these three as tokens, and a token without a documented
+     default is a token nobody can safely clear back to “automatic”. */
+  --wcrf-lb-backdrop: #090e1a;
+  --wcrf-lb-btn-bg: #2a3550;
+  --wcrf-lb-btn-fg: #ffffff;
   /* Colours — main button */
   --wcrf-btn-bg: #1565c0;
   --wcrf-btn-bg-2: #1e88e5;

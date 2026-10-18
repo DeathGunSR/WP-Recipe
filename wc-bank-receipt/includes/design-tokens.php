@@ -99,9 +99,35 @@ final class WCR_Design_Tokens {
 	public static function schema() {
 		if ( null !== self::$schema ) {
 			return self::$schema;
-		}
+		}			self::$schema = array(
 
-		self::$schema = array(
+			/* --------------------------------------------------- lightbox colours
+			 * The full-screen receipt viewer is part of the component the customer and
+			 * the manager both use, so its three colours are design tokens like any
+			 * other — the docs promise they are editable, and the preview offers them
+			 * under “نمایش تمام‌صفحهٔ رسید”. Their defaults are the values the shared
+			 * stylesheet falls back to, so an untouched installation looks identical. */
+			'--wcrf-lb-backdrop' => array(
+				'type'    => 'color',
+				'group'   => 'color',
+				'default' => '#090e1a',
+				'label'   => 'نمایش تمام‌صفحه — پس‌زمینه',
+				'hint'    => 'رنگ پردهٔ پشت تصویر رسید.',
+			),
+			'--wcrf-lb-btn-bg' => array(
+				'type'    => 'color',
+				'group'   => 'color',
+				'default' => '#2a3550',
+				'label'   => 'نمایش تمام‌صفحه — دکمهٔ بستن',
+				'hint'    => 'پس‌زمینهٔ دکمهٔ بستن روی پرده.',
+			),
+			'--wcrf-lb-btn-fg' => array(
+				'type'    => 'color',
+				'group'   => 'color',
+				'default' => '#ffffff',
+				'label'   => 'نمایش تمام‌صفحه — رنگ نشانهٔ بستن',
+				'hint'    => 'رنگ ✕ دکمهٔ بستن.',
+			),
 
 			/* --------------------------------------------------------- colours */
 			'--wcrf-pri' => array(

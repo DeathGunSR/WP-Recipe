@@ -4,7 +4,7 @@ Tags: woocommerce, bank transfer, receipt, bacs, iran, persian, payment
 Requires at least: 6.5
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 7.5.1
+Stable tag: 7.6.0
 License: GPL-2.0-or-later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 WC requires at least: 7.1
@@ -48,34 +48,71 @@ Cards have a priority, an amount limit, a transaction-count limit and an expiry 
 `get_active_card()` never returns an expired, disabled or exhausted card, and a card is
 charged once per approved receipt — never twice, not even for concurrent requests.
 
-= Admin order alerts (sound + popup) =
+= Admin order alerts (repeating sound + popup) =
 
-Managers who keep wp-admin open get a popup and an audible beep when an order is
+Managers who keep wp-admin open get a popup and an audible alarm when an order is
 placed (any payment method) or changes status through the standard WooCommerce flow:
 
 * Two independent events — `new_order` and `status_change` (with the previous and the
   new status) — are queued in the `…_events` table; the first status WooCommerce applies
 to a brand-new order is folded into its new-order event instead of becoming a second one.
+* Every event records **who caused it** (`origin`: `customer_checkout`,
+  `customer_receipt_upload`, `admin_manual_action`, `admin_receipt_review`,
+  `payment_gateway`, `system_automation`, `plugin_internal`, `unknown`). A status change a
+  manager makes by hand, a receipt decision in wp-admin or the plugin's own internal
+  transitions do **not** ring the dashboard; customer, gateway and automation changes do.
+  The SMS policy is evaluated separately, so suppressing a dashboard alert never silences
+  the customer's message.
 * The popup shows the order number, customer, order total, payment method, current
   status, order item count, the event time and a **View order** button that opens the
   order edit screen. Deleted orders stay readable from the stored snapshot.
 * One queue per manager: each user has their own cursor in user meta, so an event is
 delivered once to each manager and two browser tabs do not swallow each other's alerts.
-* The beep is generated locally in the browser (Web Audio API) — no audio file, no
+* The alarm is not a one-shot beep: while at least one event is unacknowledged the sound
+  repeats (every 12 seconds by default, filterable and bounded to 3–300 s). Reacting to an
+  event — acknowledge, dismiss or **View order**, which records the acknowledgement before
+  navigating — stops the sound for *that* event and hands it to the next one in the queue.
+* The sound is generated locally in the browser (Web Audio API) — no audio file, no
   external service, no request. It can be switched off in the plugin settings, it is
-  rate-limited so a burst of status changes beeps once instead of N times, and when the
-  browser blocks autoplay the popup still appears with a button to enable the sound.
+  rate-limited so a burst of status changes does not stack, and when the browser blocks
+  autoplay the popup still appears with a control that says a click is needed.
+* One tab is the sound leader (a short lease in `localStorage`), so a second tab on the
+  same account still draws the popup but never beeps twice for one event; a closed tab
+  hands the alarm back. Acknowledgements are remembered in the tab and on the server.
 * Polling backs off exponentially on transport errors and only fetches events newer than
   the manager's cursor; what was shown is acknowledged, so a reload never re-beeps old
   events. The queue is pruned (max 1000 rows / 7 days).
 
-= SMS (UI temporarily disabled) =
+= Receipt viewer (manager and customer) =
 
-The SMS layer is fully implemented (Kavenegar, Melli Payamak or a custom HTTP endpoint,
-per-event templates, delivery log with honest `sent` / `failed` / `unknown` statuses),
-but its tab is **disabled in this release** (`SMS_UI_ENABLED = false`): the menu entry is
-hidden, the settings pages are closed even for administrators, and no SMS is ever sent.
-Existing settings, credentials and logs are preserved — only the interface is off.
+One shared viewer (`assets/js/lightbox.js` + `assets/css/lightbox.css`) opens the receipt
+for both roles: a fixed overlay with a contain-fit image bounded to the viewport, a close
+button, backdrop and `Escape` to close, focus restore and scroll lock. The file itself is
+streamed by the plugin at `?wc_receipt_view=<order>&nonce=...`, which checks the manager
+capability or the order's ownership before sending it with
+`Content-Disposition: inline` and `Cache-Control: private, no-store` — the uploads folder
+stays protected and a direct file URL still answers 403. A PDF opens as a document, and a
+logged-out visitor keeps only the local preview of the file they just uploaded.
+
+= SMS (opt-in, silent until you configure it) =
+
+The SMS interface is available again and **nothing is sent** until a master switch, a
+provider and at least one event template are configured. Providers: Kavenegar, Melli
+Payamak or a custom HTTP endpoint, each with its own credentials (masked on screen) and
+response parser. Events: new order, any chosen order status, receipt upload, receipt
+approved, receipt rejected, payment reminder and an explicit test message — each with its
+own switch and template, with statuses chosen rather than blanket-enabled.
+
+Templates are plain text plus an allow-listed variable set (`{order_id}`, `{old_status}`,
+`{new_status}`, `{customer_name}`, `{billing_phone}`, `{order_total}`, `{receipt_status}`
+and more) resolved from the order object; there is no `eval` and no request data, and the
+preview never sends a message. Success is judged from the HTTP code *and* the provider
+payload, retries are bounded (3 attempts, 2/4/8-minute backoff) and only for transient
+failures, and a duplicate guard keyed on the event keeps the status hook and the receipt
+decision from sending the same message twice. The history page shows the delivery state,
+the attempt count and a safe error summary with filters and pagination; credentials and
+authentication headers are redacted before anything is stored.
+
 The order alerts above are completely independent of SMS.
 
 = Data policy =
@@ -101,7 +138,7 @@ remote call and no third-party request other than the SMS provider you configure
 
 Activation creates:
 
-* three tables (cards, receipt log, SMS log),
+* five tables (bank cards, receipt log, SMS log, transitions, alert events),
 * `wp-content/uploads/bank-receipts/` protected by a generated `.htaccess`,
 * hourly cron events for cleanup, deadline reminders and deadline enforcement.
 
@@ -253,6 +290,36 @@ the precedence rules described above.
 9. Appearance & style — token groups with the live panel preview
 
 == Changelog ==
+
+= 7.6.0 =
+Every order change now knows who caused it, the dashboard alarm rings until it is
+acknowledged, one receipt viewer serves both roles, the panel follows an explicit receipt
+state model, and the SMS screens are back as a complete opt-in pipeline.
+
+* New: alert events store an `origin` and a `suppressed` flag; manager-made changes,
+  receipt decisions in wp-admin and the plugin's own transitions do not ring the
+  dashboard, while customer, gateway, automation and unknown origins are queued. The SMS
+  policy is decided separately, so a suppressed dashboard alert still sends the customer
+  message the settings ask for.
+* New: the alert sound repeats until the manager reacts (default 12 s, filterable,
+  bounded 3–300 s). Acknowledge, dismiss and "View order" each record the acknowledgement
+  first and stop only that event; one tab owns the sound through a short lease, so a
+  second tab cannot double-beep.
+* New: a single shared receipt viewer on the manager's order screen and the customer's
+  panel, with `Escape`/backdrop/button close, focus restore and scroll lock; the file is
+  still streamed through the authorization-checked endpoint.
+* New: one receipt state model (`awaiting_payment`, `under_review`, `rejected`,
+  `approved`) drives the card block, the countdown, the drop zone and the notices; a
+  rejection restarts the deadline from the rejection time.
+* New: the SMS pipeline — Kavenegar, Melli Payamak and a custom endpoint; per-event
+  templates with an allow-listed variable set; bounded retries with backoff; a duplicate
+  guard; and a delivery log that records attempts, HTTP code, provider id and a redacted
+  response.
+* New: the appearance screen preview is click-to-edit — clicking a part of the preview
+  opens the tokens that style it — and the viewer colours are design tokens too.
+* Upgrade: DB version 7.6.0 adds `origin` / `suppressed` to the events table and the
+  delivery columns to the SMS log. Existing rows keep their data (old events read as
+  `unknown`); no option is renamed or deleted.
 
 = 7.5.1 =
 Reliability fix for the receipt decision path. Nothing changes for a shop where one manager

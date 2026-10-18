@@ -235,6 +235,184 @@
     if (dirty) markDirty();
   }
 
+  /* ------------------------------------------------------- element editor */
+
+  /*
+   * Interactive editing: click an element in the preview, get that element's settings.
+   *
+   * The panel is a VIEW, never a second store. Every control it renders proxies the real
+   * field of the form (`data-wcr-token` / `-num` / `-unit`), writes into it and dispatches
+   * `input`, so the existing live preview and the existing save path do all the work — and
+   * an element click can never produce a value that the server would not have received
+   * anyway. Clearing reuses the form's own “خودکار” button for the same reason.
+   */
+  var panel     = document.querySelector('[data-wcr-el-panel]');
+  var panelBody = document.querySelector('[data-wcr-el-body]');
+  var panelName = document.querySelector('[data-wcr-el-name]');
+  var panelRows = document.querySelector('[data-wcr-el-rows]');
+  var panelHint = document.querySelector('[data-wcr-el-empty]');
+  var els       = config.elements || {};
+  var tokenLabels = config.labels || {};
+  var strings   = config.strings || {};
+  var selected  = null;
+
+  function controlTarget(token) {
+    return field(token, 'data-wcr-token') || field(token, 'data-wcr-token-num');
+  }
+
+  /** Clear one token through the form's own “خودکار” button ('' = automatic). */
+  function clearToken(token) {
+    var button = form.querySelector('[data-wcr-clear="' + token + '"]');
+    if (button) {
+      button.click();
+      return;
+    }
+    var text = field(token, 'data-wcr-token');
+    if (text) text.value = '';
+    var num = field(token, 'data-wcr-token-num');
+    if (num) num.value = '';
+    var unit = field(token, 'data-wcr-token-unit');
+    if (unit) unit.value = '';
+    draw(true);
+  }
+
+  function writeToken(token, spec, value) {
+    var num = field(token, 'data-wcr-token-num');
+    var unit = field(token, 'data-wcr-token-unit');
+
+    if (num && unit) {
+      // The type scale submits a number plus an explicit unit.
+      var parsed = String(value).match(/^(\d+(?:\.\d+)?)([a-z]+)$/);
+      if (value === '') { clearToken(token); return; }
+      if (parsed && spec.ranges && spec.ranges[parsed[2]]) {
+        num.value = parsed[1];
+        unit.value = parsed[2];
+      } else {
+        num.value = value;
+        if (!unit.value) unit.value = 'px';
+      }
+      draw(true);
+      return;
+    }
+
+    var text = field(token, 'data-wcr-token');
+    if (!text) return;
+    text.value = value;
+    draw(true);
+  }
+
+  function currentValue(token) {
+    var spec = SCHEMA[token];
+    if (!spec) return '';
+    return fieldValue(token);
+  }
+
+  function buildRow(token) {
+    var spec = SCHEMA[token];
+    if (!spec) return null;
+
+    var row = document.createElement('div');
+    row.className = 'wcr-el-row';
+
+    var label = document.createElement('label');
+    label.className = 'wcr-el-label';
+    label.textContent = tokenLabels[token] || token;
+
+    var input;
+    if (spec.type === 'enum') {
+      input = document.createElement('select');
+      var none = document.createElement('option');
+      none.value = '';
+      none.textContent = strings.automatic || '';
+      input.appendChild(none);
+      for (var key in spec.options) {
+        if (!Object.prototype.hasOwnProperty.call(spec.options, key)) continue;
+        var option = document.createElement('option');
+        option.value = key;
+        option.textContent = key;
+        input.appendChild(option);
+      }
+    } else if (spec.type === 'color') {
+      input = document.createElement('input');
+      input.type = 'color';
+      input.value = /^#[0-9a-f]{6}$/i.test(currentValue(token)) ? currentValue(token) : (config.defaults[token] || '#1565c0');
+    } else if (spec.ranges && spec.ranges.px) {
+      input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = config.defaults[token] || '';
+      input.value = currentValue(token);
+    } else {
+      input = document.createElement('input');
+      input.type = 'number';
+      input.step = spec.type === 'ratio' ? '0.1' : '1';
+      if (spec.type !== 'ratio') {
+        if (spec.min !== null) input.min = spec.min;
+        if (spec.max !== null) input.max = spec.max;
+      }
+      input.value = String(currentValue(token)).replace(/[^0-9.]/g, '');
+    }
+    input.className = 'wcr-el-input';
+    input.setAttribute('data-wcr-el-token', token);
+
+    var clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'wcr-btn wcr-btn-ghost wcr-el-clear';
+    clear.textContent = strings.automatic || '';
+
+    input.addEventListener('input', function () { writeToken(token, spec, this.value); });
+    input.addEventListener('change', function () { writeToken(token, spec, this.value); });
+    clear.addEventListener('click', function () { clearToken(token); refreshPanel(); });
+
+    row.appendChild(label);
+    row.appendChild(input);
+    row.appendChild(clear);
+    return row;
+  }
+
+  function refreshPanel() {
+    if (!panelRows) return;
+    while (panelRows.firstChild) panelRows.removeChild(panelRows.firstChild);
+    if (!selected || !els[selected]) return;
+    var tokens = els[selected].tokens || [];
+    for (var i = 0; i < tokens.length; i++) {
+      var row = buildRow(tokens[i]);
+      if (row) panelRows.appendChild(row);
+    }
+  }
+
+  function selectElement(el) {
+    selected = el;
+    var cells = preview.querySelectorAll('[data-wcr-el]');
+    for (var i = 0; i < cells.length; i++) {
+      cells[i].classList.toggle('is-selected', cells[i].getAttribute('data-wcr-el') === el);
+    }
+    if (!els[el]) return;
+    if (panelName) panelName.textContent = (strings.element || '') + ' ' + els[el].label;
+    if (panelBody) panelBody.hidden = false;
+    if (panelHint) panelHint.hidden = true;
+    refreshPanel();
+  }
+
+  if (panel && preview) {
+    preview.addEventListener('click', function (event) {
+      var node = event.target.closest ? event.target.closest('[data-wcr-el]') : null;
+      if (!node) return;
+      event.preventDefault();
+      selectElement(node.getAttribute('data-wcr-el'));
+    });
+    var reset = panel.querySelector('[data-wcr-el-reset]');
+    if (reset) {
+      reset.addEventListener('click', function () {
+        if (!selected || !els[selected]) return;
+        var tokens = els[selected].tokens || [];
+        for (var i = 0; i < tokens.length; i++) clearToken(tokens[i]);
+        refreshPanel();
+      });
+    }
+    /* Any change made in the real form must be reflected in the open panel. */
+    form.addEventListener('input', function () { if (selected) refreshPanel(); });
+  }
+
   /* --------------------------------------------------------------- wiring */
 
   form.addEventListener('input', function () { draw(true); });

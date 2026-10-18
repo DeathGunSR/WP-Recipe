@@ -1,0 +1,132 @@
+/*
+ * WC Bank Receipt — shared receipt lightbox (admin + customer).
+ *
+ * One overlay for both roles; the server decides who may see which file, this file only
+ * decides how it is shown. Everything is scoped under `.wcr-lb-overlay` (or the panel
+ * trigger), so it can never style another plugin's modal — and it reads the design tokens
+ * of the panel it was opened from (`--wcrf-lb-*`), so a themed panel opens a themed
+ * lightbox.
+ */
+
+/* Trigger (in the panel, the gallery, the order screen): looks like a link/button. */
+a[data-wcr-lb] { cursor: zoom-in; }
+
+.wcr-lb-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100050;               /* above WP admin menus and the alert popup's backdrop */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 22px;
+    background: transparent;
+    direction: rtl;
+}
+/*
+ * The darkened backdrop is a pseudo-element, not the overlay's own background: the token
+ * is a plain colour (`--wcrf-lb-backdrop`), so the slight transparency the design wants is
+ * applied here — on a layer UNDER the receipt — instead of with opacity on the overlay,
+ * which would fade the very photo the manager is trying to read.
+ */
+.wcr-lb-overlay::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--wcrf-lb-backdrop, #090e1a);
+    opacity: .94;
+}
+.wcr-lb-overlay[hidden] { display: none; }
+
+/* The picture: whole, un-cropped, never larger than the viewport. */
+.wcr-lb-img {
+    display: block;
+    max-width: min(92vw, 1500px);
+    max-height: 82vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .55);
+}
+.wcr-lb-img.is-loaded { background: transparent; }
+
+/* A PDF is a document, shown as a document. */
+.wcr-lb-doc {
+    width: min(92vw, 1100px);
+    height: 78vh;
+    border: 0;
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .55);
+}
+
+.wcr-lb-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    max-width: 96vw;
+}
+
+.wcr-lb-close {
+    position: absolute;
+    top: 16px;
+    inset-inline-end: 18px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, .22);
+    background: var(--wcrf-lb-btn-bg, rgba(255, 255, 255, .16));
+    color: var(--wcrf-lb-btn-fg, #fff);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background .2s ease, transform .2s ease;
+}
+.wcr-lb-close:hover { filter: brightness(1.35); }
+.wcr-lb-close:focus-visible { outline: 3px solid #7cc4ff; outline-offset: 2px; transform: scale(1.05); }
+
+.wcr-lb-caption {
+    margin: 0;
+    color: #eef2f7;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: center;
+}
+.wcr-lb-hint {
+    margin: 0;
+    color: rgba(238, 242, 247, .72);
+    font-size: 12px;
+    text-align: center;
+}
+
+/* Controlled messages instead of a broken picture. */
+.wcr-lb-missing {
+    background: #fff;
+    color: #37474f;
+    border-radius: 12px;
+    padding: 26px 30px;
+    font-size: 15px;
+    text-align: center;
+    max-width: 90vw;
+}
+.wcr-lb-fallback {
+    color: #7cc4ff;
+    font-size: 13px;
+    text-decoration: underline;
+}
+
+/* Small screens and landscape phones: the image must stay inside the viewport. */
+@media (max-width: 782px) {
+    .wcr-lb-overlay { padding: 12px; gap: 8px; }
+    .wcr-lb-img { max-width: 94vw; max-height: 74vh; border-radius: 8px; }
+    .wcr-lb-doc { width: 94vw; height: 72vh; }
+    .wcr-lb-close { top: 10px; inset-inline-end: 10px; width: 40px; height: 40px; }
+}
+@media (max-height: 480px) {
+    .wcr-lb-img { max-height: 70vh; }
+    .wcr-lb-hint { display: none; }
+}

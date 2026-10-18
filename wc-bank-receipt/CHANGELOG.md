@@ -8,10 +8,123 @@ order-alert system and temporarily switched the SMS interface off. 7.4.0 makes t
 customer-facing receipt panel portable: one context, one renderer and three display
 methods, with the CSS and JS scoped to the panel. 7.5.0 adds the appearance layer: the
 panel follows the theme by default and can be restyled from the admin without CSS, through
-a validated set of design tokens.
+a validated set of design tokens. 7.6.0 adds what an operator needs on a busy day:
+order changes that know who caused them, an alarm that keeps ringing until it is
+acknowledged, one receipt viewer for both roles, an explicit receipt state model, and the
+SMS pipeline with its templates, retries and delivery history.
 
 Reference environment: WordPress 7.1.3, WooCommerce 11.2.1, PHP 8.2.12, HPOS enabled,
 MariaDB (XAMPP), Apache with real `.htaccess` handling.
+
+---
+
+## 7.6.0 — event origins, an alarm that keeps ringing, one receipt viewer, and the SMS pipeline
+
+The 7.5 line made the panel beautiful and the decisions safe. This release answers the three
+questions a busy shop actually asks: *who* changed this order, *did I notice*, and *where do I
+look* — and it turns the SMS screens that 7.3.0 switched off into a complete, opt-in pipeline.
+
+### Who caused the change (event origin)
+
+* Every queued alert event now records an `origin` —
+  `customer_checkout`, `customer_receipt_upload`, `admin_manual_action`, `admin_receipt_review`,
+  `payment_gateway`, `system_automation`, `plugin_internal`, `unknown` — plus a `suppressed`
+  flag, both stored on the event row (`wc_bank_receipt_events`).
+* Classification is per-request and explicit: `with_origin()` opens a scoped context that is
+  always released (even on an exception), the plugin's own transitions pass their origin down,
+  and `is_created_via()`, the admin-ajax action and the WP-CLI/CRON path are all consulted.
+  `is_admin()` alone is never used as proof of anything.
+* `admin_manual_action`, `admin_receipt_review` and `plugin_internal` are suppressed for the dashboard; every
+  customer, gateway, automation and `unknown` origin is queued. Losing a real event is worse
+  than showing one the manager caused, so the suppression list is a short allow-list.
+* The SMS policy is evaluated independently: a manager's own status change no longer rings the
+  dashboard, and still sends the customer what the shop's SMS settings say it should.
+
+### An alarm that keeps ringing until the manager reacts
+
+* The alert sound repeats every 12 seconds (option `wc_receipt_alerts_repeat`, filterable,
+  bounded 3–300 s) while at least one event is unacknowledged — it is not a one-shot beep.
+* Reacting stops *that* event: acknowledge, dismiss and “view order” all post the id first and
+  then navigate, and the next queued event takes over instead of being swallowed with it.
+* Acknowledgements are remembered in the tab (`localStorage`, capped list) and on the server,
+  so polling, a refresh, or a re-render cannot ring an event twice.
+* One tab is the sound leader (a 12-second lease in `localStorage`); a second tab on the same
+  account polls and draws its popup without beeping, and a closed tab hands the alarm back.
+* Autoplay refusal is handled honestly: the popup still appears, the sound control says a click
+  is needed, and the first gesture unlocks audio for the rest of the page's life.
+* The transition line is built as two explicit nodes (`old`, arrow, `new`) inside an
+  `unicode-bidi: isolate` LTR value, so RTL layout can never flip the order or the arrow:
+  `pending → on-hold` and `on-hold → pending` both read in their real direction.
+
+### One receipt viewer, two roles
+
+* `assets/js/lightbox.js` + `assets/css/lightbox.css` are a single shared component used by the
+  manager's order screen and the customer's panel: fixed overlay, dark backdrop, contain-fit
+  image bounded to the viewport, close button, backdrop and `Escape` to close, focus restore
+  and scroll lock. Clicking the image itself never closes it.
+* The file is streamed by the plugin (`?wc_receipt_view=<order>&nonce=…`), which checks the
+  manager capability or the order's ownership on the server, sends the detected MIME type with
+  `Content-Disposition: inline` and `Cache-Control: private, no-store`. The uploads directory
+  remains protected; a direct file URL still answers 403.
+* A PDF is a document: the trigger is typed `pdf` and the viewer opens it as a document instead
+  of pointing an `<img>` at it.
+* Guests keep their data-URI preview of the file they just uploaded; no viewable URL is minted
+  for an anonymous visitor, so an order id alone reveals nothing.
+
+### One state model for the receipt panel
+
+* `receipt_phase()` decides what the panel shows — `awaiting_payment` (card, countdown, form),
+  `under_review` (no card, no countdown, no form, the receipt is viewable), `rejected` (reason,
+  previous file, the same card, a countdown restarted from the rejection) and `approved`
+  (confirmation only). The timer, the card block, the drop zone and the notices all read it.
+* A rejection restarts the countdown from the rejection time, never from the original order
+  date, and the server re-checks expiry on every upload rather than trusting the browser clock.
+* Recording the receipt and moving the order to `on-hold` are one operation with an explicit
+  partial-failure result; a failed status change no longer leaves the panel claiming a review
+  that the order is not in.
+
+### SMS: off until you configure it, complete once you do
+
+* The SMS screens are enabled again, and nothing is sent until the master switch, a provider
+  and at least one event template are configured.
+* Providers: Kavenegar, MelliPayamak and a custom HTTP endpoint, each with its own credential
+  fields (masked on screen) and its own response parser.
+* Events: new order, any configured order status, customer receipt upload (admin notice),
+  receipt approved, receipt rejected, payment reminder and an explicit test message. Each event
+  has its own enable switch and template; statuses are chosen, not blanket-enabled.
+* Templates are plain text plus an allow-listed variable set (`{order_id}`, `{order_number}`,
+  `{old_status}`, `{new_status}`, `{order_status}`, `{customer_name}`, `{billing_first_name}`,
+  `{billing_last_name}`, `{billing_phone}`, `{order_total}`, `{currency}`, `{payment_method}`,
+  `{site_name}`, `{order_date}`, `{receipt_status}`, `{receipt_reject_reason}`) resolved by one
+  function from the order object. No `eval`, no request data; an unknown variable is reported in
+  the preview and left as typed.
+* One pipeline: `sms_send_event()` decides *whether*, `sms_deliver()` creates the queued row,
+  `sms_attempt()` talks to the provider and records the outcome. Success is judged from the HTTP
+  code *and* the provider payload, never from “no `WP_Error`”.
+* Retries are bounded (3 attempts, 2/4/8-minute backoff through WP-Cron) and only for transient
+  failures; an invalid number fails once and stays failed. A duplicate guard keyed on the event
+  keeps the status hook and the receipt decisions from sending the same message twice.
+* `wc_bank_receipt_sms_log` gains `attempts`, `http_code`, `provider_id`, `next_attempt` and the
+  redacted provider response; existing rows are migrated in place. Credentials and
+  authentication headers are redacted before anything is stored, and the history page shows the
+  delivery state, the attempt count and a safe error summary with filters and pagination.
+
+### Appearance
+
+* The «ظاهر و استایل» screen now has a click-to-edit preview: `appearance_element_map()` maps the
+  card, the card number, the status box, the countdown, the submit button, the receipt viewer
+  button, the drop zone, the notices, the headings and the lightbox to the design tokens that
+  style them, and the panel edits exactly those tokens. No Elementor required, no free-form CSS.
+* The lightbox colours are design tokens too, so the viewer the manager sees and the one the
+  customer sees can be themed from the same screen.
+
+### Upgrade notes
+
+* DB version 7.6.0: `wc_bank_receipt_events` gains `origin` and `suppressed`,
+  `wc_bank_receipt_sms_log` gains the delivery columns. Existing rows keep their data; old events
+  are read as `unknown` / not suppressed.
+* No option is renamed or deleted. `SMS_UI_ENABLED` is gone; the master switch
+  (`wc_sms_enabled`) is the only thing that decides whether the pipeline runs.
 
 ---
 
